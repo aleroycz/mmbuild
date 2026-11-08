@@ -1,0 +1,23 @@
+[package]
+name = "superimg"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Custom Android super/system image tool: sparse codec, LP metadata, ext4 in-place patch, lz4 frame, ustar."
+
+[lib]
+name = "superimg"
+path = "src/lib.rs"
+
+[[bin]]
+name = "superimg"
+path = "src/bin/superimg.rs"
+
+[dependencies]
+mmcore = { path = "../mmcore" }
+anyhow.workspace = true
+thiserror.workspace = true
+clap.workspace = true
+lz4_flex.workspace = true
+flate2.workspace = true

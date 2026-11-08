@@ -1,0 +1,16 @@
+[package]
+name = "mmadb"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Pure-Rust ADB client (USB transport + RSA auth) for mmbuild — no external adb."
+
+[dependencies]
+anyhow.workspace = true
+base64.workspace = true
+nusb = "0.1.14"
+rsa = { version = "0.9.10", features = ["pem", "sha1"] }
+sha1 = "0.10.6"
+rand = "0.8.5"
+futures-lite = "2.3.0"
