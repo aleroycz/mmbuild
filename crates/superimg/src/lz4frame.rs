@@ -16,13 +16,9 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-//! lz4 frame (de)compression for Samsung `.lz4` payloads.
-//!
-//! Samsung AP entries (`super.img.lz4`, `boot.img.lz4`, …) use the **standard
-//! lz4 frame format** (magic `04 22 4D 18`), not the legacy format. We mirror
-//! the CLI `lz4 --content-size -B6`: 1 MiB blocks, content size recorded in the
-//! header, content checksum on. Pure Rust via `lz4_flex`, so it runs identically
-//! on Linux and Windows with no native `lz4` binary.
+//! Standard lz4 frame codec for Samsung `.lz4` (1 MiB blocks, content size).
+
+#![allow(clippy::needless_option_as_deref)] /* Option<&mut dyn FnMut> needs as_deref_mut */
 
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
@@ -97,4 +93,28 @@ pub fn is_lz4(path: &Path) -> Result<bool> {
         return Ok(false);
     }
     Ok(m == [0x04, 0x22, 0x4D, 0x18])
+}
+
+/// True if `buf` starts with the standard lz4 frame magic.
+pub fn is_lz4_bytes(buf: &[u8]) -> bool {
+    buf.len() >= 4 && buf[0..4] == [0x04, 0x22, 0x4D, 0x18]
+}
+
+/// Decompress a standard lz4 frame from memory.
+pub fn decompress_bytes(input: &[u8]) -> Result<Vec<u8>> {
+    let mut dec = FrameDecoder::new(std::io::Cursor::new(input));
+    let mut out = Vec::new();
+    dec.read_to_end(&mut out).context("lz4 frame decompress")?;
+    Ok(out)
+}
+
+/// Compress bytes into a standard lz4 frame (`-B6 --content-size`).
+pub fn compress_bytes(input: &[u8]) -> Result<Vec<u8>> {
+    let mut info = FrameInfo::new();
+    info.block_size = BlockSize::Max1MB;
+    info.content_size = Some(input.len() as u64);
+    info.content_checksum = true;
+    let mut enc = FrameEncoder::with_frame_info(info, Vec::new());
+    enc.write_all(input).context("lz4 frame compress")?;
+    enc.finish().context("lz4 frame finish")
 }

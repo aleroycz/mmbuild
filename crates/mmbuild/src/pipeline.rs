@@ -16,13 +16,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-//! The end-to-end build pipeline, reported as Gradle-style tasks:
-//!   acquireFirmware → readDeviceProps → verifyCompat → compileDevice →
-//!   buildWeb → patchSystem → repackSuper → package.
-//!
-//! Nothing device-specific is hardcoded: the partition geometry comes from LP
-//! metadata, the device name/SoC from build.prop, and the output tar name is
-//! derived from that device name.
+//! Build pipeline: acquire firmware through subprojects, compile, patch system, repack super.
 
 use std::path::{Path, PathBuf};
 
@@ -40,9 +34,7 @@ pub struct Built {
     pub device: String,
 }
 
-/// Which partition images `mmbuild build` produces and co-packs into the final
-/// Odin tar. `super` (the patched system OS) is always built; `recovery` and
-/// `boot` are opt-in via `--target`.
+/// Which partition images `mmbuild build` produces and co-packs into the final Odin tar.
 #[derive(Clone, Copy, Default)]
 pub struct BuildTargets {
     pub recovery: bool,
@@ -50,17 +42,15 @@ pub struct BuildTargets {
 }
 
 impl BuildTargets {
-    /// Parse the repeatable `--target` values. An empty list means "super +
-    /// recovery" — a plain `mmbuild build` always co-packs the recovery image so
-    /// the flashable tar is self-contained. Pass explicit `-t` values to choose
-    /// exactly what to build (e.g. `-t super` for system-only, `-t all` for
-    /// everything). `super`/`system` are accepted no-ops since the system image
-    /// is always built.
+    /// Parse the repeatable `--target` values.
+    ///
+    /// Empty list -> super only (build.toml `[package].members`). `recovery`,
+    /// `boot` and `all` add the experimental custom images plus a patched
+    /// vbmeta; the supported path is the soft Micro BIOS in `/system/bin/init`.
     pub fn parse(items: &[String]) -> Result<Self> {
-        // No flags → the default package includes recovery.
         if items.iter().all(|s| s.trim().is_empty()) {
             return Ok(BuildTargets {
-                recovery: true,
+                recovery: false,
                 boot: false,
             });
         }
@@ -75,9 +65,9 @@ impl BuildTargets {
                     t.recovery = true;
                     t.boot = true;
                 }
-                other => bail!(
-                    "unknown build target '{other}' (expected: super, recovery, boot, all)"
-                ),
+                other => {
+                    bail!("unknown build target '{other}' (expected: super, recovery, boot, all)")
+                }
             }
         }
         Ok(t)
@@ -91,23 +81,31 @@ pub fn run(
     targets: BuildTargets,
     log: &Logger,
 ) -> Result<Built> {
-    log.plan(8 + targets.recovery as u32 + targets.boot as u32);
+    // Base tasks: acquire, props, compat, subprojects, compile, patch, repack.
+    log.plan(7 + targets.recovery as u32 + targets.boot as u32);
     log.set_phase("EXECUTING");
     log.lifecycle(&format!(
         "MicroMiner build — {} jobs, firmware source {:?}",
         settings.effective_jobs(),
         cfg.firmware.source
     ));
-
     let work = resolve(root, &settings.paths.work);
     std::fs::create_dir_all(&work)?;
 
-    // 1. Acquire firmware → raw super (copied into workdir so we never edit the
-    //    user's source file in place).
+    // 1. Acquire firmware -> raw super (copied into workdir so we never edit the user's source file
+    // / pristine cache in place). Cache hits still refresh work/super.raw because patchSystem
+    // mutates it.
     log.task_start("mmbuild:acquireFirmware");
     let acquired = crate::firmware::acquire_raw_super(root, cfg, settings, log)?;
-    let raw_super = ensure_in_workdir(&acquired, &work)?;
-    log.task_done("mmbuild:acquireFirmware", Outcome::Executed);
+    let raw_super = ensure_in_workdir(&acquired.raw_super, &work)?;
+    log.task_done(
+        "mmbuild:acquireFirmware",
+        if acquired.cache_hit {
+            Outcome::UpToDate
+        } else {
+            Outcome::Executed
+        },
+    );
 
     // 2. Read device identity from the firmware's build.prop (no hardcoding).
     log.task_start("mmbuild:readDeviceProps");
@@ -137,35 +135,47 @@ pub fn run(
     verify_compat(cfg, &props, &meta, &raw_super, poff, psize, log)?;
     log.task_done("mmbuild:verifyCompat", Outcome::Executed);
 
-    // 4. Build sub-projects (mmgui, recovery, external deps) and install their
-    //    outputs in place (e.g. build/mmgui → rootfs/mmgui) so patchSystem below
-    //    picks up freshly-built companion binaries. No tar is produced here.
+    // 4. Build sub-projects (mmgui, recovery, external deps) and install their outputs in place
+    // (e.g. build/mmgui -> rootfs/mmgui) so patchSystem below picks up freshly-built companion
+    // binaries. No tar is produced here.
     log.task_start("mmbuild:buildSubprojects");
-    let subs = subproject::build_all(root, settings, log, None, false)?;
+    let subs = subproject::build_all(root, settings, log, None, false, &cfg.device.model)?;
     log.task_done(
         "mmbuild:buildSubprojects",
-        if subs.is_empty() { Outcome::Skipped } else { Outcome::Executed },
+        if subs.is_empty() {
+            Outcome::Skipped
+        } else {
+            Outcome::Executed
+        },
     );
 
-    // 5. Cross-compile the device binary.
+    // 5. Cross-compile the device binary (skipped when zig inputs are unchanged).
     log.task_start("mmbuild:compileDevice");
-    toolchain::compile_device(root, cfg, settings, log)?;
-    log.task_done("mmbuild:compileDevice", Outcome::Executed);
-
-    // 6. Build the web portal.
-    log.task_start("mmbuild:buildWeb");
-    let web_out = toolchain::build_web(root, cfg, settings, log)?;
+    let compiled = toolchain::compile_device(root, cfg, settings, log)?;
     log.task_done(
-        "mmbuild:buildWeb",
-        if web_out.is_some() { Outcome::Executed } else { Outcome::Skipped },
+        "mmbuild:compileDevice",
+        if compiled.up_to_date {
+            Outcome::UpToDate
+        } else {
+            Outcome::Executed
+        },
     );
 
-    // 7. Patch the system partition (replace files + sync web tree).
+    // 6. Patch the system partition (in-place file replacements + runtime apex).
     log.task_start("mmbuild:patchSystem");
     {
         let mut fs = Ext4::open(&raw_super, poff, psize, true)?;
         for r in &cfg.patch.replace {
             let src = resolve(root, &r.from);
+            if !src.exists() {
+                bail!(
+                    "patch source missing for {}: {}\n  \
+                     Build the binary first (compileDevice / `mmbuild sub`), or fix \
+                     [[patch.replace]] in build.toml.\n  Hint: run `mmbuild doctor`.",
+                    r.path,
+                    src.display()
+                );
+            }
             let data = std::fs::read(&src).with_context(|| format!("read {}", src.display()))?;
             if fs.lookup(&r.path).is_ok() {
                 log.detail(&format!("replace {}", r.path));
@@ -177,9 +187,8 @@ pub fn run(
                     mmcore::human_bytes(data.len() as u64)
                 ));
             } else {
-                // New file not present in the stock image (e.g. our mm_hostapd):
-                // create it in its parent directory and mark it executable, since
-                // create_file_in defaults to 0644.
+                // New file not present in the stock image (e.g. our mm_hostapd): create it in its
+                // parent directory and mark it executable, since create_file_in defaults to 0644.
                 let p = r.path.trim_end_matches('/');
                 let (dir, name) = p.rsplit_once('/').unwrap_or(("", p));
                 let dir = if dir.is_empty() { "/" } else { dir };
@@ -197,21 +206,13 @@ pub fn run(
                 ));
             }
         }
-        if let Some(out) = &web_out {
-            log.detail(&format!("sync {} ← web", cfg.web.dest));
-            fs.sync_tree(&cfg.web.dest, out)
-                .with_context(|| format!("sync web into {}", cfg.web.dest))?;
-            log.info(&format!("synced web portal into {}", cfg.web.dest));
-        }
 
-        // Stage the runtime linker for our minimal init. The dynamic linker and
-        // bionic libc live inside com.android.runtime.apex; stock apexd loop-
-        // mounts it at boot, but our init doesn't run apexd — so WITHOUT this,
-        // /apex/com.android.runtime/bin/linker64 doesn't exist and every
-        // dynamically-linked vendor/system binary (wmt_loader, wmt_launcher,
-        // hostapd, wpa_supplicant, rild, ...) fails to exec with rc=127.
-        // We extract the apex's ext4 payload as a plain image so init can
-        // loop-mount it; see mount_runtime_apex() in init/main.c.
+        // Stage the runtime linker for our minimal init. The dynamic linker and bionic libc live
+        // inside com.android.runtime.apex; stock apexd loop- mounts it at boot, but our init
+        // doesn't run apexd - so WITHOUT this, /apex/com.android.runtime/bin/linker64 doesn't exist
+        // and every dynamically-linked vendor/system binary (wmt_loader, wmt_launcher, hostapd,
+        // wpa_supplicant, rild, ...) fails to exec with rc=127. We extract the apex's ext4 payload
+        // as a plain image so init can loop-mount it; see mount_runtime_apex() in init/main.c.
         {
             let apex = "/system/apex/com.android.runtime.apex";
             let img = "/system/apex/com.android.runtime.img";
@@ -221,7 +222,8 @@ pub fn run(
                         if fs.lookup(img).is_ok() {
                             fs.replace_file(img, payload)?;
                         } else {
-                            let parent = fs.lookup("/system/apex")
+                            let parent = fs
+                                .lookup("/system/apex")
                                 .context("locate /system/apex to stage runtime image")?;
                             fs.create_file_in(parent, "com.android.runtime.img", payload, None)?;
                         }
@@ -235,60 +237,77 @@ pub fn run(
                         "warning: apex_payload.img not STORED in runtime apex; linker not staged",
                     ),
                 },
-                Err(_) => log.info(
-                    "note: com.android.runtime.apex absent; skipping runtime linker stage",
-                ),
+                Err(_) => {
+                    log.info("note: com.android.runtime.apex absent; skipping runtime linker stage")
+                }
             }
         }
 
         let free = fs.superblock().free_blocks_count * fs.superblock().block_size as u64;
-        log.info(&format!("free space after patch: {}", mmcore::human_bytes(free)));
+        log.info(&format!(
+            "free space after patch: {}",
+            mmcore::human_bytes(free)
+        ));
     }
     log.task_done("mmbuild:patchSystem", Outcome::Executed);
 
-    // 7b. Optional extra target images. We build these BEFORE the tar is sealed
-    //     so they ride in the SAME flashable {device}_System_OS.tar as the system
-    //     image, each compressed to the lz4 member Odin expects.
+    // Optional extra target images. Built BEFORE the tar is sealed so they ride
+    // in the SAME flashable {device}_System_OS.tar as the system image.
+    // Custom boot/recovery drop the stock AVB footer, so a verification-disabled
+    // vbmeta MUST be co-packed or the bootloader rejects the images.
     let mut extra: Vec<(String, PathBuf)> = Vec::new();
+    let mut vbmetas_for_tar: Vec<(String, PathBuf)> = Vec::new();
     if targets.recovery {
-        // Our custom recovery (recovery_init + mmgui menu) ONLY. We deliberately
-        // do NOT fold a vbmeta into the system tar: the device's existing vbmeta
-        // works and must be kept as-is, so shipping ours here would needlessly
-        // overwrite a known-good partition. (The standalone `mmbuild recovery`
-        // _Recovery.tar under build/ still carries its patched vbmeta for the
-        // separate unlocked-bootloader flashing path if it is ever needed.)
+        log.info(
+            "custom recovery: Magisk-style inject (keeps SEANDROID/SignerVer02, drops AVBf); \
+             flash patched vbmeta",
+        );
         log.task_start("mmbuild:buildRecovery");
         let art = crate::recovery::build(root, cfg, settings, &device, log)
             .context("build recovery target")?;
         let rlz4 = work.join("recovery.img.lz4");
         lz4frame::compress_file(&art.img, &rlz4, None)?;
         extra.push(("recovery.img.lz4".into(), rlz4));
+        if !art.vbmetas.is_empty() {
+            vbmetas_for_tar = art.vbmetas;
+        }
         log.task_done("mmbuild:buildRecovery", Outcome::Executed);
     }
     if targets.boot {
-        // Stock boot.img, kept exactly as shipped (we do not modify boot — see
-        // the system-img approach). Included only so it can be reflashed from the
-        // same tar "in case we need to"; extracted straight from the AP firmware.
-        log.task_start("mmbuild:stageBoot");
-        let ap = resolve(root, &cfg.firmware.local_ap);
-        if !ap.exists() {
-            bail!(
-                "boot target needs the AP firmware ([firmware].local_ap); not found at {}",
-                ap.display()
-            );
-        }
-        let boot_raw = work.join("boot_stock.img");
-        crate::recovery::extract_image(&ap, "boot", &boot_raw, log)
-            .context("extract stock boot.img from AP")?;
+        log.info(
+            "boot: stock boot.img verbatim + patched vbmeta (soft Micro BIOS in /system/bin/init)",
+        );
+        log.task_start("mmbuild:buildBoot");
+        let art = crate::boot::build_stock(root, cfg, settings, &device, log)
+            .context("build boot target")?;
         let blz4 = work.join("boot.img.lz4");
-        lz4frame::compress_file(&boot_raw, &blz4, None)?;
+        lz4frame::compress_file(&art.img, &blz4, None)?;
         extra.push(("boot.img.lz4".into(), blz4));
-        log.task_done("mmbuild:stageBoot", Outcome::Executed);
+        if !art.vbmetas.is_empty() {
+            vbmetas_for_tar = art.vbmetas;
+        }
+        log.task_done("mmbuild:buildBoot", Outcome::Executed);
+    }
+    if vbmetas_for_tar.is_empty() && (targets.boot || targets.recovery) {
+        log.warn(
+            "boot/recovery co-packed without vbmeta — device may refuse to boot; \
+             flash vbmeta_disabled.img separately or unlock + fastboot --disable-verification",
+        );
+    }
+    for (stem_img, vb) in vbmetas_for_tar {
+        // stem_img is "vbmeta.img" / "vbmeta_samsung.img"
+        let member = format!("{stem_img}.lz4");
+        let vlz4 = work.join(&member);
+        lz4frame::compress_file(&vb, &vlz4, None)?;
+        extra.push((member.clone(), vlz4));
+        log.info(&format!("co-packing {member} (AVB flags disabled)"));
     }
 
-    // 8. Repack: raw → sparse → lz4 → tar (super + any extra target images).
+    // Repack: raw -> sparse -> lz4 -> tar (super + any extra target images).
     log.task_start("mmbuild:repackSuper");
-    let tar = repack(root, cfg, settings, &raw_super, &meta, &device, &work, &extra, log)?;
+    let tar = repack(
+        root, cfg, settings, &raw_super, &meta, &device, &work, &extra, log,
+    )?;
     log.task_done("mmbuild:repackSuper", Outcome::Executed);
 
     Ok(Built { tar, device })
@@ -317,14 +336,16 @@ fn verify_compat(
         .with_context(|| format!("partition '{}' is not valid ext4", cfg.patch.partition))?;
 
     let fw_model = props.model().unwrap_or("");
-    let same_model = !cfg.device.model.is_empty()
-        && fw_model.eq_ignore_ascii_case(&cfg.device.model);
+    let same_model =
+        !cfg.device.model.is_empty() && fw_model.eq_ignore_ascii_case(&cfg.device.model);
 
     match cfg.device.compat {
         CompatPolicy::SocLayout => {
             let soc = props.platform().unwrap_or("");
             if soc.is_empty() {
-                log.warn("could not read SoC/platform from build.prop; proceeding on layout check only");
+                log.warn(
+                    "could not read SoC/platform from build.prop; proceeding on layout check only",
+                );
             } else {
                 log.info(&format!("SoC verified: {soc}"));
             }
@@ -344,9 +365,12 @@ fn verify_compat(
             }
         }
         CompatPolicy::Curated => {
-            // Curated list validation would load compat.toml; for now require exact.
+            // Exact match only; there is no curated compat list.
             if !same_model {
-                bail!("curated policy: firmware model {fw_model} != requested {}", cfg.device.model);
+                bail!(
+                    "curated policy: firmware model {fw_model} != requested {}",
+                    cfg.device.model
+                );
             }
         }
     }
@@ -382,33 +406,84 @@ fn repack(
         let mut cb = |c: u64, t: u64| log.op_progress(c, t);
         lz4frame::compress_file(&sparse_path, &lz4_path, Some(&mut cb))?;
     }
-    // Intermediate sparse no longer needed.
+    // Drop the intermediate sparse image.
     std::fs::remove_file(&sparse_path).ok();
 
     let tar_name = expand_device(&cfg.package.tar_name, device);
     let tar_path = root.join(&tar_name);
+    /* Write via a sibling temp file so Odin/7-Zip holding the previous tar
+     * open doesn't fail the whole build (Windows ERROR_SHARING_VIOLATION). */
+    let tar_tmp = root.join(format!("{tar_name}.tmp"));
     log.detail(&format!("tar (ustar) → {tar_name}"));
-    let f = std::fs::File::create(&tar_path)?;
-    let mut tb = tarball::TarBuilder::new(std::io::BufWriter::new(f));
-    for m in &cfg.package.members {
-        let src = match m.as_str() {
-            "super.img.lz4" => lz4_path.clone(),
-            other => work.join(other),
-        };
-        if !src.exists() {
-            bail!("tar member {m} not found at {}", src.display());
+    {
+        let f = std::fs::File::create(&tar_tmp)
+            .with_context(|| format!("create {}", tar_tmp.display()))?;
+        let mut tb = tarball::TarBuilder::new(std::io::BufWriter::new(f));
+        for m in &cfg.package.members {
+            let src = match m.as_str() {
+                "super.img.lz4" => lz4_path.clone(),
+                other => work.join(other),
+            };
+            if !src.exists() {
+                bail!("tar member {m} not found at {}", src.display());
+            }
+            tb.append_path(m, &src)?;
         }
-        tb.append_path(m, &src)?;
-    }
-    // Co-packed target images (recovery.img.lz4, vbmeta.img.lz4, boot.img.lz4).
-    for (name, src) in extra {
-        if !src.exists() {
-            bail!("target member {name} not found at {}", src.display());
+        // Co-packed target images (recovery.img.lz4, boot.img.lz4).
+        for (name, src) in extra {
+            if !src.exists() {
+                bail!("target member {name} not found at {}", src.display());
+            }
+            tb.append_path(name, src)?;
+            log.info(&format!("+ co-packed {name}"));
         }
-        tb.append_path(name, src)?;
-        log.info(&format!("+ co-packed {name}"));
+        tb.finish()?;
     }
-    tb.finish()?;
+    match std::fs::rename(&tar_tmp, &tar_path) {
+        Ok(()) => {}
+        Err(e) => {
+            // Prefer a free sibling name when Odin/Explorer holds the usual
+            // targets open (Windows ERROR_SHARING_VIOLATION / Access denied).
+            let stem = tar_name.trim_end_matches(".tar");
+            let alts = [
+                root.join(format!("{stem}.new.tar")),
+                root.join(format!("{stem}_flash.tar")),
+                root.join(format!("{stem}.{}.tar", std::process::id())),
+            ];
+            let mut kept = None;
+            let mut last_err = None;
+            for alt in &alts {
+                match std::fs::rename(&tar_tmp, alt) {
+                    Ok(()) => {
+                        kept = Some(alt.clone());
+                        break;
+                    }
+                    Err(err) => last_err = Some(err),
+                }
+            }
+            let alt = kept.with_context(|| {
+                format!(
+                    "replace {} failed ({e}); also failed to keep alternate ({})",
+                    tar_path.display(),
+                    last_err
+                        .map(|err| err.to_string())
+                        .unwrap_or_else(|| "no candidates".into())
+                )
+            })?;
+            log.warn(&format!(
+                "{} is locked (close Odin/7-Zip); wrote {}",
+                tar_path.display(),
+                alt.display()
+            ));
+            let sz = std::fs::metadata(&alt)?.len();
+            log.lifecycle(&format!(
+                "package: {} ({})",
+                alt.display(),
+                mmcore::human_bytes(sz)
+            ));
+            return Ok(alt);
+        }
+    }
     let sz = std::fs::metadata(&tar_path)?.len();
     log.lifecycle(&format!(
         "package: {} ({})",
@@ -418,18 +493,19 @@ fn repack(
     Ok(tar_path)
 }
 
-/// Copy the raw super into the workdir if it isn't already there, so we never
-/// mutate the user's firmware file in place.
+/// Stage a pristine raw super into the workdir.
 fn ensure_in_workdir(raw: &Path, work: &Path) -> Result<PathBuf> {
-    let in_work = raw.parent().map(|p| p == work).unwrap_or(false);
-    if in_work {
-        return Ok(raw.to_path_buf());
-    }
     let dest = work.join("super.raw");
-    if dest.exists() && std::fs::metadata(&dest)?.len() == std::fs::metadata(raw)?.len() {
+    let in_work = raw
+        .canonicalize()
+        .ok()
+        .and_then(|r| dest.canonicalize().ok().map(|d| r == d))
+        .unwrap_or(false);
+    if in_work {
         return Ok(dest);
     }
-    std::fs::copy(raw, &dest).with_context(|| format!("stage {} → {}", raw.display(), dest.display()))?;
+    std::fs::copy(raw, &dest)
+        .with_context(|| format!("stage {} → {}", raw.display(), dest.display()))?;
     Ok(dest)
 }
 
@@ -442,10 +518,8 @@ fn resolve(root: &Path, p: &str) -> PathBuf {
     }
 }
 
-/// Return the bytes of a STORED (uncompressed) entry `name` inside a ZIP archive
-/// without inflating anything. APEX files are ZIPs whose `apex_payload.img` entry
-/// is always stored uncompressed, so this slices it out directly. Returns None if
-/// the entry is missing, compressed, or the archive is malformed.
+/// Return the bytes of a STORED (uncompressed) entry `name` inside a ZIP archive without inflating
+/// anything.
 fn extract_stored_zip_entry<'a>(zip: &'a [u8], name: &str) -> Option<&'a [u8]> {
     let le16 = |b: &[u8]| u16::from_le_bytes([b[0], b[1]]) as usize;
     let le32 = |b: &[u8]| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize;
@@ -487,7 +561,9 @@ fn extract_stored_zip_entry<'a>(zip: &'a [u8], name: &str) -> Option<&'a [u8]> {
             if method != 0 {
                 return None; // not STORED; we don't inflate
             }
-            if local_off + 30 > zip.len() || zip[local_off..local_off + 4] != [0x50, 0x4b, 0x03, 0x04] {
+            if local_off + 30 > zip.len()
+                || zip[local_off..local_off + 4] != [0x50, 0x4b, 0x03, 0x04]
+            {
                 return None;
             }
             let l_name = le16(&zip[local_off + 26..local_off + 28]);

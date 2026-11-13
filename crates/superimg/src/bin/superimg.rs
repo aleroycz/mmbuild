@@ -16,10 +16,9 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-//! `superimg` CLI — standalone driver for the image toolkit, handy for
-//! inspecting and patching images outside the full `mmbuild` pipeline.
+//! Standalone superimg CLI for image inspect/patch outside mmbuild.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -27,7 +26,10 @@ use mmcore::human_bytes;
 use superimg::{ext4::Ext4, lp, lz4frame, sparse};
 
 #[derive(Parser)]
-#[command(name = "superimg", about = "Android super/system image toolkit (pure Rust)")]
+#[command(
+    name = "superimg",
+    about = "Android super/system image toolkit (pure Rust)"
+)]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -94,14 +96,12 @@ enum Cmd {
     Lz4 { input: PathBuf, output: PathBuf },
 }
 
-fn resolve_partition(image: &PathBuf, part: &str) -> Result<(u64, u64)> {
+fn resolve_partition(image: &Path, part: &str) -> Result<(u64, u64)> {
     let md = lp::read_metadata(image).context("read LP metadata")?;
     let p = md
         .partition_or_slot_a(part)
         .with_context(|| format!("partition '{part}' not found in super"))?;
-    let off = p
-        .first_offset()
-        .context("partition has no extent")?;
+    let off = p.first_offset().context("partition has no extent")?;
     Ok((off, p.size_bytes()))
 }
 
@@ -110,7 +110,10 @@ fn main() -> Result<()> {
     match cli.cmd {
         Cmd::Info { image, partition } => {
             let md = lp::read_metadata(&image)?;
-            println!("LP metadata (logical block size {}):", md.logical_block_size);
+            println!(
+                "LP metadata (logical block size {}):",
+                md.logical_block_size
+            );
             for p in &md.partitions {
                 let off = p.first_offset().unwrap_or(0);
                 println!(
@@ -119,7 +122,11 @@ fn main() -> Result<()> {
                     off,
                     p.size_bytes(),
                     human_bytes(p.size_bytes()),
-                    if p.is_contiguous() { "" } else { "  [non-contiguous]" }
+                    if p.is_contiguous() {
+                        ""
+                    } else {
+                        "  [non-contiguous]"
+                    }
                 );
             }
             if let Some(p) = md.partition_or_slot_a(&partition) {
@@ -128,8 +135,14 @@ fn main() -> Result<()> {
                 let sb = fs.superblock().clone();
                 println!("\next4 '{partition}' @ offset {off}:");
                 println!("  block size      : {}", sb.block_size);
-                println!("  blocks          : {} (free {})", sb.blocks_count, sb.free_blocks_count);
-                println!("  inodes          : {} (free {})", sb.inodes_count, sb.free_inodes_count);
+                println!(
+                    "  blocks          : {} (free {})",
+                    sb.blocks_count, sb.free_blocks_count
+                );
+                println!(
+                    "  inodes          : {} (free {})",
+                    sb.inodes_count, sb.free_inodes_count
+                );
                 println!("  inode size      : {}", sb.inode_size);
                 println!("  64-bit          : {}", fs.has_64bit());
                 println!("  metadata_csum   : {}", fs.has_metadata_csum());
@@ -139,14 +152,21 @@ fn main() -> Result<()> {
                     "  free space      : {}",
                     human_bytes(sb.free_blocks_count * sb.block_size as u64)
                 );
-                if let Ok(ino) = fs.lookup("/system/bin/init").or_else(|_| fs.lookup("/init")) {
+                if let Ok(ino) = fs
+                    .lookup("/system/bin/init")
+                    .or_else(|_| fs.lookup("/init"))
+                {
                     if let Ok(Some(ctx)) = fs.selinux_context(ino) {
                         println!("  /system/bin/init selinux: {ctx}");
                     }
                 }
             }
         }
-        Cmd::Ls { image, path, partition } => {
+        Cmd::Ls {
+            image,
+            path,
+            partition,
+        } => {
             let (off, size) = resolve_partition(&image, &partition)?;
             let mut fs = Ext4::open(&image, off, size, false)?;
             for e in fs.list_dir(&path)? {
@@ -158,22 +178,40 @@ fn main() -> Result<()> {
                 println!("{kind} {:>10}  {}", e.inode, e.name);
             }
         }
-        Cmd::Extract { image, path, out, partition } => {
+        Cmd::Extract {
+            image,
+            path,
+            out,
+            partition,
+        } => {
             let (off, size) = resolve_partition(&image, &partition)?;
             let mut fs = Ext4::open(&image, off, size, false)?;
             let inode_data = fs.read_file(&path)?;
             std::fs::write(&out, &inode_data)?;
-            println!("wrote {} ({})", out.display(), human_bytes(inode_data.len() as u64));
+            println!(
+                "wrote {} ({})",
+                out.display(),
+                human_bytes(inode_data.len() as u64)
+            );
         }
         Cmd::Unsparse { input, output } => {
             let n = sparse::sparse_to_raw(&input, &output, None)?;
             println!("raw image: {} ({})", output.display(), human_bytes(n));
         }
-        Cmd::Sparse { input, output, block_size } => {
+        Cmd::Sparse {
+            input,
+            output,
+            block_size,
+        } => {
             sparse::raw_to_sparse(&input, &output, block_size, None)?;
             println!("sparse image: {}", output.display());
         }
-        Cmd::Replace { image, path, src, partition } => {
+        Cmd::Replace {
+            image,
+            path,
+            src,
+            partition,
+        } => {
             let (off, size) = resolve_partition(&image, &partition)?;
             let data = std::fs::read(&src).with_context(|| format!("read {}", src.display()))?;
             let mut fs = Ext4::open(&image, off, size, true)?;
@@ -189,12 +227,21 @@ fn main() -> Result<()> {
                 after
             );
         }
-        Cmd::SyncTree { image, dest, src, partition } => {
+        Cmd::SyncTree {
+            image,
+            dest,
+            src,
+            partition,
+        } => {
             let (off, size) = resolve_partition(&image, &partition)?;
             let mut fs = Ext4::open(&image, off, size, true)?;
             fs.sync_tree(&dest, &src)?;
             let listed = fs.list_dir(&dest)?;
-            println!("synced {dest} <- {} ({} entries)", src.display(), listed.len());
+            println!(
+                "synced {dest} <- {} ({} entries)",
+                src.display(),
+                listed.len()
+            );
         }
         Cmd::Unlz4 { input, output } => {
             let n = lz4frame::decompress_file(&input, &output, None)?;

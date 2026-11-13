@@ -16,9 +16,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-//! Self-contained ADB client over USB (nusb + RSA auth); no external adb.
-//! Scope: connect, authenticate, shell, read files (via cat/base64, no `sync:`).
-//! Crypto/framing are unit-tested; the live USB path needs on-hardware confirm.
+//! USB ADB client (nusb + RSA): connect, shell, file read via base64.
 
 mod auth;
 mod proto;
@@ -48,6 +46,35 @@ pub struct AdbDevice {
     next_local_id: u32,
     pub banner: Banner,
     pub serial: Option<String>,
+}
+
+/// True if at least one ADB interface is on the USB bus right now.
+pub fn device_present() -> bool {
+    UsbTransport::list().map(|c| !c.is_empty()).unwrap_or(false)
+}
+
+/// Wait for USB ADB device (None = forever).
+pub fn wait_for_device(timeout: Option<std::time::Duration>) -> Result<()> {
+    use std::time::{Duration, Instant};
+    let start = Instant::now();
+    let mut announced = false;
+    loop {
+        if device_present() {
+            return Ok(());
+        }
+        if let Some(t) = timeout {
+            if start.elapsed() >= t {
+                bail!("timed out after {}s waiting for an ADB device", t.as_secs());
+            }
+        }
+        if !announced {
+            eprintln!(
+                "waiting for device… (enable USB debugging, connect over USB, accept the prompt)"
+            );
+            announced = true;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
 }
 
 impl AdbDevice {
@@ -118,8 +145,7 @@ impl AdbDevice {
         Ok(Message::new(h.command, h.arg0, h.arg1, payload))
     }
 
-    /// CNXN + AUTH handshake. Reuses ~/.android/adbkey; on an unknown key the
-    /// phone shows an authorization prompt which the user must accept.
+    /// ADB CNXN/AUTH; reuses ~/.android/adbkey.
     fn handshake(&mut self) -> Result<()> {
         let banner = b"host::features=cmd,shell_v2\0".to_vec();
         self.write_msg(&Message::new(A_CNXN, A_VERSION, MAX_PAYLOAD, banner))?;
@@ -184,7 +210,10 @@ impl AdbDevice {
                     bail!("device refused to open stream {destination:?}");
                 }
                 A_OKAY | A_WRTE | A_CLSE => continue, // not ours yet
-                other => bail!("unexpected {} opening {destination:?}", Message::new(other, 0, 0, vec![]).code()),
+                other => bail!(
+                    "unexpected {} opening {destination:?}",
+                    Message::new(other, 0, 0, vec![]).code()
+                ),
             }
         }
 
@@ -221,7 +250,6 @@ impl AdbDevice {
     }
 
     /// Read a binary file off the device, base64-encoded over the shell.
-    /// Tries toybox/busybox base64, then a plain `base64`.
     pub fn read_binary_file(&mut self, path: &str) -> Result<Vec<u8>> {
         let out = self.shell(&format!(
             "(toybox base64 '{path}' || base64 '{path}') 2>/dev/null"
@@ -237,9 +265,14 @@ impl AdbDevice {
 }
 
 fn parse_banner(payload: &[u8]) -> Banner {
-    let raw = String::from_utf8_lossy(payload).trim_end_matches('\0').to_string();
+    let raw = String::from_utf8_lossy(payload)
+        .trim_end_matches('\0')
+        .to_string();
     // "<systemtype>:<serial>:<k=v;k=v;...>"
-    let mut b = Banner { raw: raw.clone(), ..Banner::default() };
+    let mut b = Banner {
+        raw: raw.clone(),
+        ..Banner::default()
+    };
     if let Some(props) = raw.splitn(3, ':').nth(2) {
         for kv in props.split(';') {
             if let Some((k, v)) = kv.split_once('=') {

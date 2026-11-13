@@ -16,16 +16,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-//! `mmbuild test` — compile and run the C test programs under `tests/`.
-//!
-//! Each test file is a standalone program: it `#include`s the module(s) it
-//! exercises (so there is no shared link graph to manage), defines `main()`,
-//! and returns 0 on success / non-zero on failure. We build each for the host
-//! with `zig cc` and run it, cargo-test style, collecting pass/fail and timing.
-//!
-//! Host-native on purpose: the portable logic (hashing, CRCs, parsers, the
-//! SHA-256d share math) is what unit tests should cover, and it runs anywhere.
-//! Device-only code (framebuffer, evdev, Linux syscalls) is not meant for this.
+//! `mmbuild test`: host zig cc compile+run of standalone C programs in tests/.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -49,8 +40,7 @@ pub struct TestOutcome {
     pub output: String,
 }
 
-/// Build + run every matching test. Returns the per-test outcomes in a stable
-/// (name-sorted) order; the caller prints the summary and sets the exit code.
+/// Build+run matching tests; name-sorted outcomes.
 pub fn run(
     root: &Path,
     spec: &TestSpec,
@@ -72,8 +62,7 @@ pub fn run(
     }
 
     let out_dir = resolve(root, &spec.out_dir);
-    std::fs::create_dir_all(&out_dir)
-        .with_context(|| format!("create {}", out_dir.display()))?;
+    std::fs::create_dir_all(&out_dir).with_context(|| format!("create {}", out_dir.display()))?;
 
     let exe_ext = if cfg!(windows) { ".exe" } else { "" };
     let timeout = if spec.timeout_secs == 0 {
@@ -104,9 +93,16 @@ pub fn run(
         for inc in &spec.include_dirs {
             cmd.arg("-I").arg(resolve(root, inc));
         }
-        cmd.arg(src).arg("-lm").arg("-o").arg(&exe);
+        cmd.arg(src).arg("-lm");
+        // Host RNG (BCryptGenRandom) lives in bcrypt on Windows.
+        if spec.target.is_empty() && cfg!(windows) {
+            cmd.arg("-lbcrypt");
+        }
+        cmd.arg("-o").arg(&exe);
         cmd.current_dir(root);
-        let build = cmd.output().with_context(|| format!("spawn zig cc for {name}"))?;
+        let build = cmd
+            .output()
+            .with_context(|| format!("spawn zig cc for {name}"))?;
 
         if !build.status.success() {
             let msg = String::from_utf8_lossy(&build.stderr);
@@ -139,9 +135,7 @@ pub fn run(
     Ok(outcomes)
 }
 
-/// Run a built test exe with an optional timeout. Output is captured via pipes;
-/// test programs are expected to print little, so the OS pipe buffer never fills
-/// before we read it after exit.
+/// Run a built test exe with an optional timeout.
 fn run_one(
     exe: &Path,
     root: &Path,

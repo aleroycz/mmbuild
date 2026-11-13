@@ -16,8 +16,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-//! Toolchain stages: discover Zig, cross-compile the device binary, build the
-//! web portal. Commands are streamed to the Gradle-style logger.
+//! Locate Zig and cross-compile C via `zig cc`.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -28,23 +27,39 @@ use mmcore::log::Logger;
 use walkdir::WalkDir;
 
 use crate::config::{BuildConfig, Settings, SourceSpec};
+use crate::fingerprint;
 
 /// Find the Zig compiler: explicit setting, bundled `bin/zig/zig(.exe)`, or PATH.
 pub fn find_zig(root: &Path, settings: &Settings) -> Result<PathBuf> {
+    let exe = if cfg!(windows) { "zig.exe" } else { "zig" };
+    let bundled = root.join("bin").join("zig").join(exe);
+
     if !settings.toolchain.zig.is_empty() {
         let p = resolve(root, &settings.toolchain.zig);
         if p.exists() {
             return Ok(p);
         }
-        bail!("configured zig not found at {}", p.display());
+        bail!(
+            "configured zig not found at {}\n  \
+             Fix [toolchain].zig in settings.toml, or clear it to auto-discover \
+             bundled bin/zig/{} or PATH.\n  Hint: run `mmbuild doctor`.",
+            p.display(),
+            exe
+        );
     }
-    let exe = if cfg!(windows) { "zig.exe" } else { "zig" };
-    let bundled = root.join("bin").join("zig").join(exe);
     if bundled.exists() {
         return Ok(bundled);
     }
-    // PATH fallback.
-    which(exe).context("zig not found (set [toolchain].zig in settings.toml or install zig)")
+    match which(exe) {
+        Ok(p) => Ok(p),
+        Err(_) => bail!(
+            "zig not found (looked for [toolchain].zig, {}, and PATH)\n  \
+             Install Zig, place it at bin/zig/{}, or set [toolchain].zig in \
+             settings.toml.\n  Hint: run `mmbuild doctor`.",
+            bundled.display(),
+            exe
+        ),
+    }
 }
 
 fn which(exe: &str) -> Result<PathBuf> {
@@ -67,8 +82,8 @@ fn resolve(root: &Path, p: &str) -> PathBuf {
     }
 }
 
-/// Expand include globs (supports `dir/**/*.ext` and `dir/*.ext` and exact
-/// files) into a sorted, de-duplicated file list.
+/// Expand include globs (supports `dir/**/*.ext` and `dir/*.ext` and exact files) into a sorted,
+/// de-duplicated file list.
 pub fn collect_sources(
     root: &Path,
     patterns: &[String],
@@ -84,9 +99,11 @@ pub fn collect_sources(
             for e in WalkDir::new(&base_dir).into_iter().filter_map(|e| e.ok()) {
                 if e.file_type().is_file() {
                     let keep = match &ext {
-                        Some(ext) if after.starts_with("*.") => {
-                            e.path().extension().map(|x| x == ext.as_str()).unwrap_or(false)
-                        }
+                        Some(ext) if after.starts_with("*.") => e
+                            .path()
+                            .extension()
+                            .map(|x| x == ext.as_str())
+                            .unwrap_or(false),
                         _ => true,
                     };
                     if keep {
@@ -139,24 +156,33 @@ pub fn compile_device(
     cfg: &BuildConfig,
     settings: &Settings,
     log: &Logger,
-) -> Result<PathBuf> {
+) -> Result<CompileResult> {
     compile_c(root, &cfg.source, settings, log)
 }
 
-/// Compile a C binary described by a [`SourceSpec`] with `zig cc`. This is the
-/// single code path used for both the root device binary (`[source]`) and every
-/// `kind = "cbinary"` sub-project (`[build]`), so they share identical handling
-/// of globbing, vendored/first-party split, strict warnings and linking.
+/// Outcome of a `zig cc` build (or an up-to-date skip).
+pub struct CompileResult {
+    #[allow(dead_code)] // available to callers; pipeline currently uses `up_to_date` only
+    pub output: PathBuf,
+    pub up_to_date: bool,
+}
+
+/// Compile a C binary described by a [`SourceSpec`] with `zig cc`.
 pub fn compile_c(
     root: &Path,
     spec: &SourceSpec,
     settings: &Settings,
     log: &Logger,
-) -> Result<PathBuf> {
+) -> Result<CompileResult> {
     let zig = find_zig(root, settings)?;
     let sources = collect_sources(root, &spec.include, &spec.exclude)?;
     if sources.is_empty() {
-        bail!("no sources matched {:?}", spec.include);
+        bail!(
+            "no sources matched {:?} (after excludes {:?})\n  \
+             Check [source].include / [build].include globs relative to the project root.",
+            spec.include,
+            spec.exclude
+        );
     }
     log.info(&format!("zig: {}", zig.display()));
     log.info(&format!("compiling {} source files", sources.len()));
@@ -166,10 +192,36 @@ pub fn compile_c(
         std::fs::create_dir_all(parent).ok();
     }
 
-    // Split vendored/third-party TUs out of the first-party set. We never edit
-    // upstream sources to satisfy our warning flags, so those TUs are compiled
-    // to objects with warnings off and linked in, while first-party code is held
-    // to the full strict `-Werror` set below.
+    // Pragmatic incremental: skip zig cc when sources/headers/flags/zig match the stamp written
+    // next to the output on the last successful link.
+    let digest = fingerprint::compile_digest(
+        root,
+        &sources,
+        &spec.include_dirs,
+        &spec.target,
+        &spec.mcpu,
+        &spec.cflags,
+        &spec.third_party,
+        &output,
+        &zig,
+    )?;
+    let stamp = fingerprint::compile_stamp_path(&output);
+    if output.is_file() && fingerprint::read_stamp(&stamp).as_deref() == Some(digest.as_str()) {
+        let size = std::fs::metadata(&output)?.len();
+        log.info(&format!(
+            "up-to-date {} ({})",
+            output.display(),
+            mmcore::human_bytes(size)
+        ));
+        return Ok(CompileResult {
+            output,
+            up_to_date: true,
+        });
+    }
+
+    // Split vendored/third-party TUs out of the first-party set. We never edit upstream sources to
+    // satisfy our warning flags, so those TUs are compiled to objects with warnings off and linked
+    // in, while first-party code is held to the full strict `-Werror` set below.
     let (vendored, first_party): (Vec<_>, Vec<_>) = sources.iter().cloned().partition(|s| {
         let p = s.to_string_lossy();
         spec.third_party.iter().any(|m| p.contains(m.as_str()))
@@ -181,7 +233,8 @@ pub fn compile_c(
             .parent()
             .map(|p| p.join("obj"))
             .unwrap_or_else(|| PathBuf::from("obj"));
-        std::fs::create_dir_all(&obj_dir).ok();
+        std::fs::create_dir_all(&obj_dir)
+            .with_context(|| format!("create vendored object dir {}", obj_dir.display()))?;
         log.info(&format!(
             "compiling {} vendored TU(s) with warnings disabled",
             vendored.len()
@@ -194,8 +247,8 @@ pub fn compile_c(
                 .arg("-target")
                 .arg(&spec.target)
                 .arg(format!("-mcpu={}", spec.mcpu));
-            // Keep the non-warning build flags (-static/-O3/etc.), drop every
-            // -W/-Werror flag, and silence the TU entirely with -w.
+            // Keep the non-warning build flags (-static/-O3/etc.), drop every -W/-Werror flag, and
+            // silence the TU entirely with -w.
             for f in &spec.cflags {
                 if f == "-lm" || f.starts_with("-W") {
                     continue;
@@ -255,66 +308,15 @@ pub fn compile_c(
     if !out.status.success() {
         bail!("zig cc failed ({})", out.status);
     }
+    fingerprint::write_stamp(&stamp, &digest)?;
     let size = std::fs::metadata(&output)?.len();
     log.info(&format!(
         "built {} ({})",
         output.display(),
         mmcore::human_bytes(size)
     ));
-    Ok(output)
-}
-
-/// Build the web portal (if enabled); returns the built output directory.
-pub fn build_web(
-    root: &Path,
-    cfg: &BuildConfig,
-    settings: &Settings,
-    log: &Logger,
-) -> Result<Option<PathBuf>> {
-    if !cfg.web.enabled {
-        log.info("web portal disabled; skipping");
-        return Ok(None);
-    }
-    let web_dir = resolve(root, &cfg.web.dir);
-    if !web_dir.exists() {
-        bail!("web dir not found: {}", web_dir.display());
-    }
-    let cmd_line = &settings.toolchain.web_builder;
-    log.info(&format!("web build: `{cmd_line}` in {}", web_dir.display()));
-
-    // Split the command line naively on whitespace.
-    let mut parts = cmd_line.split_whitespace();
-    let prog = parts.next().context("empty web_builder command")?;
-    let (prog, extra) = portable_cmd(prog);
-    let mut cmd = Command::new(prog);
-    cmd.args(extra);
-    for a in parts {
-        cmd.arg(a);
-    }
-    cmd.current_dir(&web_dir);
-    log.detail("running web build");
-    let out = cmd.output().with_context(|| format!("spawn `{cmd_line}`"))?;
-    if !out.status.success() {
-        log.warn(&String::from_utf8_lossy(&out.stderr));
-        bail!("web build failed ({})", out.status);
-    }
-    let built = web_dir.join(&cfg.web.out);
-    if !built.exists() {
-        bail!("web build produced no {}", built.display());
-    }
-    log.info(&format!("web output: {}", built.display()));
-    Ok(Some(built))
-}
-
-/// On Windows, `npx`/`npm` are `.cmd` shims that must run via `cmd /c`.
-fn portable_cmd(prog: &str) -> (&str, Vec<&str>) {
-    if cfg!(windows) && matches!(prog, "npx" | "npm" | "node" | "yarn" | "pnpm") {
-        ("cmd", vec!["/c", leak(prog)])
-    } else {
-        (prog, vec![])
-    }
-}
-
-fn leak(s: &str) -> &'static str {
-    Box::leak(s.to_string().into_boxed_str())
+    Ok(CompileResult {
+        output,
+        up_to_date: false,
+    })
 }

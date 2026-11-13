@@ -16,25 +16,14 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-//! Gradle-style console logging.
-//!
-//! Model (mirrors Gradle's rich console):
-//!   * A scrolling region of permanent output — lifecycle lines like
-//!     `> Task :superimg:patchSystem`, warnings, errors.
-//!   * A live status area pinned to the bottom: a progress bar with percent,
-//!     the current phase (CONFIGURING / EXECUTING), elapsed time, and the
-//!     operation currently running (`> :fus:download  41% (512/1024 MiB)`).
-//!
-//! When stdout is not a TTY (piped to a file/CI), the live area is suppressed
-//! and only the permanent lines are emitted — the equivalent of Gradle's
-//! `--console=plain`.
+//! Task lifecycle console with optional TTY progress bar.
 
 use std::io::{IsTerminal, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-/// Verbosity, matching Gradle's `-q`, default, `-i`, `-d`.
+/// Log verbosity (quiet / default / info / debug).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Level {
     Quiet = 0,
@@ -43,7 +32,7 @@ pub enum Level {
     Debug = 3,
 }
 
-/// Outcome printed on a task's completion line, Gradle-style.
+/// Task completion outcome shown on the lifecycle line.
 #[derive(Clone, Copy, Debug)]
 pub enum Outcome {
     Executed,
@@ -91,15 +80,13 @@ struct State {
     done_tasks: u32,
     /// The operation currently shown in the live area (innermost running task).
     active: Option<Op>,
-    /// Number of physical lines the status area currently occupies, so we can
-    /// erase exactly what we drew before printing a permanent line.
+    /// Status-area line count for erase-before-print.
     drawn_lines: u16,
     has_warnings: bool,
     has_errors: bool,
 }
 
-/// Shared, cloneable logger handle. A background thread repaints the status
-/// area so the elapsed-time clock advances even while a long op is silent.
+/// Cloneable logger; background thread repaints status.
 #[derive(Clone)]
 pub struct Logger {
     inner: Arc<Mutex<State>>,
@@ -169,7 +156,12 @@ impl Logger {
         let mut st = self.inner.lock().unwrap();
         if let Some(op) = st.active.as_mut() {
             // keep the task prefix, replace trailing detail
-            let base = op.label.split(" > ").next().unwrap_or(&op.label).to_string();
+            let base = op
+                .label
+                .split(" > ")
+                .next()
+                .unwrap_or(&op.label)
+                .to_string();
             op.label = if detail.is_empty() {
                 base
             } else {
@@ -269,7 +261,7 @@ impl Logger {
         emit_permanent(&mut st, &line);
     }
 
-    /// Final footer: `BUILD SUCCESSFUL in 1m 3s` / `BUILD FAILED in …`.
+    /// Footer line: `BUILD SUCCESSFUL in 1m 3s` or `BUILD FAILED in <duration>`.
     pub fn finish(&self, success: bool) {
         let mut st = self.inner.lock().unwrap();
         self.stop.store(true, Ordering::Relaxed);
@@ -283,7 +275,15 @@ impl Logger {
         let mut out = std::io::stdout().lock();
         let _ = writeln!(out);
         if st.color {
-            let _ = writeln!(out, "{}{}{} in {}{}", ansi::BOLD, c, word, elapsed, ansi::RESET);
+            let _ = writeln!(
+                out,
+                "{}{}{} in {}{}",
+                ansi::BOLD,
+                c,
+                word,
+                elapsed,
+                ansi::RESET
+            );
         } else {
             let _ = writeln!(out, "{word} in {elapsed}");
         }
@@ -332,7 +332,10 @@ fn redraw(st: &mut State) {
         return;
     }
     clear_status(st);
-    let width = crossterm::terminal::size().map(|(w, _)| w).unwrap_or(80).min(120);
+    let width = crossterm::terminal::size()
+        .map(|(w, _)| w)
+        .unwrap_or(80)
+        .min(120);
     let mut lines: Vec<String> = Vec::new();
 
     // Bar line: <====----> NN% PHASE [elapsed]
@@ -373,7 +376,11 @@ fn redraw(st: &mut State) {
         let prog = match op.progress {
             Some((c, t)) if t > 0 => {
                 let p = ((c as f64 / t as f64) * 100.0).round() as u32;
-                format!("  {p}% ({}/{})", crate::human_bytes(c), crate::human_bytes(t))
+                format!(
+                    "  {p}% ({}/{})",
+                    crate::human_bytes(c),
+                    crate::human_bytes(t)
+                )
             }
             _ => String::new(),
         };

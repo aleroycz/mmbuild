@@ -19,7 +19,7 @@ clap = { version = "4", features = ["derive", "wrap_help"] }
 crossterm = "0.27"
 walkdir = "2"
 num_cpus = "1"
-ureq = { version = "2", features = ["tls"] }
+ureq = { version = "2", features = ["tls", "cookies"] }
 aes = "0.8"
 cbc = "0.1"
 ecb = "0.1"

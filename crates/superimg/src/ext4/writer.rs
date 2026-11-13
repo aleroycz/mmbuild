@@ -16,20 +16,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-//! ext4 mutation for patching an Android `system` partition in place.
-//!
-//! The target fs (validated against the real A12 super) is: 4 KiB blocks,
-//! 32-bit, extent-mapped, `flex_bg`, `gdt_csum` (crc16 group-descriptor
-//! checksums + `uninit_bg`), and **no** `metadata_csum`. So the only checksums
-//! we must maintain are the per-group crc16s; inodes, bitmaps and directory
-//! blocks are plain.
-//!
-//! Allocation strategy avoids the `uninit_bg` hazard: callers free the old
-//! blocks/inodes of what they're replacing *before* allocating the new ones, so
-//! the allocator always finds space in already-initialized groups and never has
-//! to synthesize an uninitialized group's bitmap (which, with `flex_bg`, is
-//! error-prone). If only uninitialized groups have space, we error clearly
-//! rather than risk corruption.
+//! ext4 in-place mutation: extents, flex_bg, gdt_csum, no metadata_csum.
 
 use anyhow::{bail, Context, Result};
 
@@ -134,9 +121,7 @@ impl Ext4 {
 
     // ---- block allocation / free ----
 
-    /// Allocate `count` blocks, preferring a single contiguous run. Returns the
-    /// physical block numbers (sorted). Errors if space is only in
-    /// uninitialized groups or exhausted.
+    /// Allocate `count` blocks, preferring a single contiguous run.
     fn alloc_blocks(&mut self, count: u64) -> Result<Vec<u64>> {
         if count == 0 {
             return Ok(vec![]);
@@ -268,14 +253,7 @@ impl Ext4 {
 
     // ---- inode allocation / free ----
 
-    /// Initialize an `uninit_bg` group's inode metadata so inodes can be
-    /// allocated from it: lay down a fresh inode bitmap (real inodes free, the
-    /// trailing padding bits beyond `inodes_per_group` marked used), zero the
-    /// group's inode table (its lazy-init blocks may be DONT_CARE/garbage in the
-    /// source image), then clear `BG_INODE_UNINIT` and set `bg_itable_unused` to
-    /// 0 in `d`. The caller writes the descriptor (which recomputes the crc16).
-    /// Safe for this fs's feature set: gdt_csum + uninit_bg + flex_bg, 32-bit,
-    /// no metadata_csum (so no bitmap/inode-table checksum fields to maintain).
+    /// Initialize uninit_bg inode metadata and inode bitmap for a new group.
     fn init_inode_group(&mut self, g: usize, d: &mut [u8]) -> Result<()> {
         let ipg = self.sb.inodes_per_group as usize;
         let bs = self.sb.block_size as usize;
@@ -287,7 +265,7 @@ impl Ext4 {
         self.write_block(bm_block, &bm)?;
         // Zero the whole inode table for the group.
         let itable_bytes = ipg * self.sb.inode_size as usize;
-        let itable_blocks = ((itable_bytes + bs - 1) / bs) as u64;
+        let itable_blocks = itable_bytes.div_ceil(bs) as u64;
         let base = self.gd[g].inode_table;
         let zero = vec![0u8; bs];
         for i in 0..itable_blocks {
@@ -308,8 +286,8 @@ impl Ext4 {
             if free == 0 {
                 continue;
             }
-            // The free inodes may live in a still-uninitialized group; lay down
-            // its bitmap/table so we can allocate from it.
+            // The free inodes may live in a still-uninitialized group; lay down its bitmap/table so
+            // we can allocate from it.
             if rd_u16(&d, 18) & BG_INODE_UNINIT != 0 {
                 self.init_inode_group(g, &mut d)?;
             }
@@ -370,9 +348,8 @@ impl Ext4 {
 
     // ---- extent tree (depth 0, inline) ----
 
-    /// Build an inline extent tree (header + leaves) into a 60-byte i_block
-    /// buffer from a sorted list of physical blocks. Coalesces contiguous runs;
-    /// up to 4 extents fit inline.
+    /// Build an inline extent tree (header + leaves) into a 60-byte i_block buffer from a sorted
+    /// list of physical blocks.
     fn build_inline_extents(blocks: &[u64]) -> Result<[u8; 60]> {
         let mut runs: Vec<(u32, u64, u32)> = Vec::new(); // (logical, phys_start, len)
         let mut logical = 0u32;
@@ -380,7 +357,8 @@ impl Ext4 {
         while i < blocks.len() {
             let start = blocks[i];
             let mut len = 1u32;
-            while i + (len as usize) < blocks.len() && blocks[i + len as usize] == start + len as u64
+            while i + (len as usize) < blocks.len()
+                && blocks[i + len as usize] == start + len as u64
             {
                 len += 1;
             }
@@ -412,9 +390,8 @@ impl Ext4 {
 
     // ---- public: replace a regular file's contents in place ----
 
-    /// Overwrite the contents of the regular file at `path`, preserving its
-    /// inode number and therefore its SELinux context. Frees the old blocks and
-    /// reallocates (reusing the freed space where possible).
+    /// Overwrite the contents of the regular file at `path`, preserving its inode number and
+    /// therefore its SELinux context.
     pub fn replace_file(&mut self, path: &str, data: &[u8]) -> Result<()> {
         let ino = self
             .lookup(path)
@@ -434,7 +411,7 @@ impl Ext4 {
         self.free_blocks(&old_blocks)?;
 
         let bs = self.bs();
-        let nblocks = (data.len() as u64 + bs - 1) / bs;
+        let nblocks = (data.len() as u64).div_ceil(bs);
         let new_blocks = self.alloc_blocks(nblocks)?;
         // Write data.
         for (i, &blk) in new_blocks.iter().enumerate() {
@@ -449,7 +426,7 @@ impl Ext4 {
         wr_u32(&mut raw, 4, (data.len() as u64 & 0xffff_ffff) as u32); // i_size_lo
         wr_u32(&mut raw, 108, (data.len() as u64 >> 32) as u32); // i_size_high
         wr_u32(&mut raw, 28, (nblocks * (bs / 512)) as u32); // i_blocks_lo (512B sectors)
-        // i_flags: ensure EXTENTS set.
+                                                             // i_flags: ensure EXTENTS set.
         let flags = u32::from_le_bytes([raw[32], raw[33], raw[34], raw[35]]) | EXT4_EXTENTS_FL;
         wr_u32(&mut raw, 32, flags);
         // Rewrite i_block extent area.
@@ -484,7 +461,11 @@ impl Ext4 {
         if raw_is_reg(&raw) {
             wr_u32(&mut raw, 108, (size >> 32) as u32);
         }
-        wr_u32(&mut raw, 28, (blocks.len() as u64 * (self.bs() / 512)) as u32);
+        wr_u32(
+            &mut raw,
+            28,
+            (blocks.len() as u64 * (self.bs() / 512)) as u32,
+        );
         let flags = u32::from_le_bytes([raw[32], raw[33], raw[34], raw[35]]) | EXT4_EXTENTS_FL;
         wr_u32(&mut raw, 32, flags);
         for b in &mut raw[40..100] {
@@ -511,7 +492,8 @@ impl Ext4 {
             let mut data = self.read_block(blk)?;
             let mut pos = 0usize;
             while pos + 8 <= bs {
-                let ino = u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
+                let ino =
+                    u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
                 let rec_len = rd_u16(&data, pos + 4) as usize;
                 let name_len = data[pos + 6] as usize;
                 if rec_len < 8 {
@@ -539,7 +521,7 @@ impl Ext4 {
             }
         }
 
-        // No room — append a fresh directory block.
+        // No room - append a fresh directory block.
         let new_blk = self.alloc_blocks(1)?[0];
         let mut data = vec![0u8; bs];
         wr_u32(&mut data, 0, child_ino);
@@ -564,13 +546,17 @@ impl Ext4 {
             let mut pos = 0usize;
             let mut prev: Option<usize> = None;
             while pos + 8 <= bs {
-                let ino = u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
+                let ino =
+                    u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
                 let rec_len = rd_u16(&data, pos + 4) as usize;
                 let name_len = data[pos + 6] as usize;
                 if rec_len < 8 {
                     break;
                 }
-                if ino != 0 && name_len == name.len() && &data[pos + 8..pos + 8 + name_len] == name.as_bytes() {
+                if ino != 0
+                    && name_len == name.len()
+                    && &data[pos + 8..pos + 8 + name_len] == name.as_bytes()
+                {
                     match prev {
                         Some(p) => {
                             // Merge this record into the previous one.
@@ -578,7 +564,7 @@ impl Ext4 {
                             wr_u16(&mut data, p + 4, (prev_rec + rec_len) as u16);
                         }
                         None => {
-                            // First entry: just blank the inode field.
+                            // First entry: zero the inode field only.
                             wr_u32(&mut data, pos, 0);
                         }
                     }
@@ -614,7 +600,7 @@ impl Ext4 {
     ) -> Result<u32> {
         let selinux = self.selinux_or_inherit(parent_ino, ctx)?;
         let bs = self.bs();
-        let nblocks = (data.len() as u64 + bs - 1) / bs;
+        let nblocks = (data.len() as u64).div_ceil(bs);
         let blocks = self.alloc_blocks(nblocks)?;
         for (i, &blk) in blocks.iter().enumerate() {
             let start = i as u64 * bs;
@@ -641,10 +627,10 @@ impl Ext4 {
     }
 
     /// Set the permission bits of an existing regular file (keeps S_IFREG).
-    /// Used to mark newly-created binaries (e.g. our hostapd) executable, since
-    /// create_file_in defaults to 0644.
     pub fn chmod_reg(&mut self, path: &str, perm: u16) -> Result<()> {
-        let ino = self.lookup(path).with_context(|| format!("chmod_reg: {path}"))?;
+        let ino = self
+            .lookup(path)
+            .with_context(|| format!("chmod_reg: {path}"))?;
         let off = self.inode_offset(ino)?;
         let mut m = [0u8; 2];
         wr_u16(&mut m, 0, S_IFREG | perm);
@@ -733,8 +719,7 @@ impl Ext4 {
         Ok(())
     }
 
-    /// Mirror a local directory tree into `dest_dir` inside the fs, replacing it
-    /// if it already exists. Inherits the destination parent's SELinux context.
+    /// Sync local dir into dest_dir (replace; inherit SELinux).
     pub fn sync_tree(&mut self, dest_dir: &str, local_root: &std::path::Path) -> Result<()> {
         if self.lookup(dest_dir).is_ok() {
             self.remove_path(dest_dir)?;

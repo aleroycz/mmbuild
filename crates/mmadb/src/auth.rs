@@ -16,9 +16,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-//! ADB RSA auth. Sign adbd's 20-byte token (PKCS#1 v1.5, token treated as a
-//! SHA-1 digest) and send the Android RSAPublicKey blob on first contact. Reuse
-//! ~/.android/adbkey (shared with real adb) or generate and persist one.
+//! ADB RSA token sign and RSAPublicKey blob for adbd.
 
 use std::path::{Path, PathBuf};
 
@@ -62,8 +60,8 @@ impl AdbKey {
 
     /// Load a key from a PEM file, trying PKCS#8 then PKCS#1 armor.
     pub fn from_file(path: &Path) -> Result<AdbKey> {
-        let pem = std::fs::read_to_string(path)
-            .with_context(|| format!("read {}", path.display()))?;
+        let pem =
+            std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
         let private = RsaPrivateKey::from_pkcs8_pem(&pem)
             .or_else(|_| RsaPrivateKey::from_pkcs1_pem(&pem))
             .with_context(|| format!("parse private key {}", path.display()))?;
@@ -115,8 +113,7 @@ fn home_dir() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-/// Serialize an RSA public key into Android's little-endian `RSAPublicKey`
-/// struct (4 + 4 + 256 + 256 + 4 = 524 bytes), as consumed by adbd.
+/// Android RSAPublicKey blob (524 bytes) for adbd AUTH.
 fn encode_android_pubkey(key: &RsaPublicKey) -> Result<Vec<u8>> {
     let n = key.n();
     let modulus_le = to_fixed_le(n, MODULUS_BYTES)?;
@@ -215,7 +212,7 @@ mod tests {
         let token = [0x42u8; 20];
         let sig = key.sign_token(&token).unwrap();
         assert_eq!(sig.len(), 256); // 2048-bit signature
-        // Verify it validates against our own public key.
+                                    // Verify it validates against our own public key.
         key.public
             .verify(Pkcs1v15Sign::new::<Sha1>(), &token, &sig)
             .expect("self-verify");

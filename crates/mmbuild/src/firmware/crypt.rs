@@ -16,27 +16,22 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-//! Samsung FUS crypto.
+//! Samsung FUS crypto (nonce auth + firmware AES keys).
 //!
-//! Faithful reimplementation of the samloader/samfirm scheme (GPL-3.0+,
-//! algorithm (C) 2020 nlscc — reimplemented here in Rust):
-//!   * server nonce  : AES-256-CBC, key = KEY_1, IV = KEY_1[..16], PKCS#7
-//!   * auth signature: AES-256-CBC, key = derive_key(nonce), IV = key[..16]
-//!   * firmware body : AES-128-ECB, key = MD5(logic_check), PKCS#7 on last block
-//!   * V4 key        : MD5(logic_check(fw_version, logic_value_factory))
-//!   * V2 key (old)  : MD5("region:model:version")
+//! Post-2025 Smart Download auth (samloader-fus / SamFirm_Reborn >=0.3.7):
+//! - Session nonce for LOGIC_CHECK = raw `NONCE` response header (opaque).
+//! - Authorization signature = lowercase hex of AES-128-ECB(`AUTH_AES_KEY`,
+//!   first 16 bytes of that header, padded with ASCII `'0'`).
 
 use anyhow::{bail, Context, Result};
-use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use md5::{Digest, Md5};
 
-const KEY_1: &[u8; 32] = b"hqzdurufm2c8mf6bsjezu1qgveouv7c7";
-const KEY_2: &[u8; 16] = b"w13r4cvf4hctaujv";
+use aes::cipher::{generic_array::GenericArray, BlockEncrypt, KeyInit};
 
-// AES-256-CBC
-type Aes256CbcDec = cbc::Decryptor<aes::Aes256>;
-type Aes256CbcEnc = cbc::Encryptor<aes::Aes256>;
-use cbc::cipher::{block_padding::Pkcs7, BlockDecryptMut, BlockEncryptMut, KeyIvInit};
+/// Auth key provided by @henr1kas / @ducthoe (SamFirm / samloader-fus).
+const AUTH_AES_KEY: [u8; 16] = [
+    0x42, 0x2e, 0x73, 0x73, 0x36, 0x17, 0xae, 0x2b, 0x19, 0x89, 0x40, 0xfd, 0x4e, 0x32, 0xb0, 0xa5,
+];
 
 /// `logic_check`: for each nonce char, index into `inp` by its low nibble.
 pub fn logic_check(inp: &str, nonce: &str) -> Result<String> {
@@ -52,42 +47,29 @@ pub fn logic_check(inp: &str, nonce: &str) -> Result<String> {
     Ok(out)
 }
 
-/// Decrypt the base64 `NONCE` header into the plaintext nonce string.
-pub fn decrypt_nonce(enc_b64: &str) -> Result<String> {
-    let mut buf = B64.decode(enc_b64.trim()).context("base64 nonce")?;
-    let iv = &KEY_1[..16];
-    let pt = Aes256CbcDec::new(KEY_1.into(), iv.into())
-        .decrypt_padded_mut::<Pkcs7>(&mut buf)
-        .map_err(|e| anyhow::anyhow!("nonce decrypt: {e}"))?;
-    Ok(String::from_utf8_lossy(pt).to_string())
+fn auth_block(header: &str) -> [u8; 16] {
+    let mut block = [b'0'; 16];
+    let nb = header.as_bytes();
+    let n = nb.len().min(16);
+    block[..n].copy_from_slice(&nb[..n]);
+    block
 }
 
-fn derive_key(nonce: &str) -> Result<[u8; 32]> {
-    if nonce.len() < 16 {
-        bail!("nonce too short for key derivation");
+/// Keep the raw `NONCE` header as the session nonce (used in LOGIC_CHECK).
+pub fn session_nonce(enc_header: &str) -> Result<String> {
+    let n = enc_header.trim();
+    if n.is_empty() {
+        bail!("empty NONCE header");
     }
-    let nb = nonce.as_bytes();
-    let mut key = [0u8; 32];
-    for i in 0..16 {
-        key[i] = KEY_1[(nb[i] as usize) % 16];
-    }
-    key[16..].copy_from_slice(KEY_2);
-    Ok(key)
+    Ok(n.to_string())
 }
 
-/// Build the base64 `signature` for the Authorization header from the nonce.
-pub fn get_auth(nonce: &str) -> Result<String> {
-    let key = derive_key(nonce)?;
-    let iv: [u8; 16] = key[..16].try_into().unwrap();
-    let data = nonce.as_bytes();
-    // PKCS#7 always appends between 1 and a full block of padding.
-    let padded_len = (data.len() / 16 + 1) * 16;
-    let mut buf = vec![0u8; padded_len];
-    buf[..data.len()].copy_from_slice(data);
-    let ct = Aes256CbcEnc::new(&key.into(), &iv.into())
-        .encrypt_padded_mut::<Pkcs7>(&mut buf, data.len())
-        .map_err(|e| anyhow::anyhow!("auth encrypt: {e}"))?;
-    Ok(B64.encode(ct))
+/// Authorization `signature` = hex(AES-128-ECB(AUTH_AES_KEY, header[:16])).
+pub fn get_auth(enc_header: &str) -> Result<String> {
+    let cipher = aes::Aes128::new_from_slice(&AUTH_AES_KEY).context("AES key")?;
+    let mut block = GenericArray::clone_from_slice(&auth_block(enc_header.trim()));
+    cipher.encrypt_block(&mut block);
+    Ok(block.iter().map(|b| format!("{b:02x}")).collect())
 }
 
 fn md5_16(s: &str) -> [u8; 16] {
@@ -128,26 +110,23 @@ pub fn decrypt_file(
     let mut w = BufWriter::with_capacity(1 << 20, std::fs::File::create(output)?);
     let cipher = aes::Aes128::new(GenericArray::from_slice(key));
 
-    let mut buf = vec![0u8; 1 << 20]; // multiple of 16
+    let mut buf = vec![0u8; 1 << 20];
     let mut done: u64 = 0;
-    let mut carry: Vec<u8> = Vec::new(); // hold last decrypted block to unpad at EOF
+    let mut carry: Vec<u8> = Vec::new();
     loop {
         let n = read_full(&mut r, &mut buf)?;
         if n == 0 {
             break;
         }
-        // Decrypt each 16-byte block in place.
         for block in buf[..n].chunks_exact_mut(16) {
             let mut b = GenericArray::clone_from_slice(block);
             cipher.decrypt_block(&mut b);
             block.copy_from_slice(&b);
         }
-        // Flush the previous carry (now known not to be the last block).
         if !carry.is_empty() {
             w.write_all(&carry)?;
             carry.clear();
         }
-        // Keep the final 16 bytes of this read as the potential last block.
         let keep = &buf[n - 16..n];
         carry.extend_from_slice(keep);
         w.write_all(&buf[..n - 16])?;
@@ -156,10 +135,9 @@ pub fn decrypt_file(
             cb(done, total);
         }
     }
-    // Unpad the final block (PKCS#7).
     if !carry.is_empty() {
         let pad = *carry.last().unwrap() as usize;
-        let keep = if pad >= 1 && pad <= 16 && pad <= carry.len() {
+        let keep = if (1..=16).contains(&pad) && pad <= carry.len() {
             carry.len() - pad
         } else {
             carry.len()
@@ -179,4 +157,29 @@ fn read_full(r: &mut impl std::io::Read, buf: &mut [u8]) -> Result<usize> {
         }
     }
     Ok(filled)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn get_auth_is_hex32() {
+        let sig = get_auth("abcdefghijklmnop").unwrap();
+        assert_eq!(sig.len(), 32);
+        assert!(sig.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn session_nonce_passthrough() {
+        let h = "iBsj/nWszkakFLDD4+lzKzIYTjeOSoQcokfwyKl+dKk=";
+        assert_eq!(session_nonce(h).unwrap(), h);
+    }
+
+    #[test]
+    fn logic_check_indexes_low_nibble() {
+        let inp = "0123456789abcdef";
+        assert_eq!(logic_check(inp, "00").unwrap(), "00");
+        assert_eq!(logic_check(inp, "a").unwrap(), "1");
+    }
 }

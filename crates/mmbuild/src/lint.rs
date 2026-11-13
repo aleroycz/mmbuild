@@ -16,21 +16,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-//! `mmbuild lint` — the strict-warnings gate for our first-party C, the C-side
-//! equivalent of `cargo clippy`. It drives the bundled clang (through `zig cc`)
-//! over every source with a harsh warning set (and, optionally, the clang
-//! static analyzer) and fails on the first finding, so a green `mmbuild lint`
-//! guarantees a `-Werror` build will not break.
-//!
-//! ## The zig-cc cache gotcha
-//!
-//! `zig cc` memoises compilations in a global cache and, crucially, **replays
-//! nothing on a cache hit** — the second identical invocation prints *zero*
-//! diagnostics and exits 0, which would make this linter silently "pass". We
-//! defeat that by stamping each compile with a unique `-DMM_LINT_NONCE=<n>`
-//! macro (unused by the code) so every run is a cache miss and the warnings are
-//! always emitted. `-fsyntax-only` is also broken under `zig cc` (FileNotFound),
-//! so we compile to a throwaway object with `-c -o`.
+//! `mmbuild lint`: zig cc warning gate; MM_LINT_NONCE defeats zig compile-cache false passes.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -66,10 +52,7 @@ pub struct LintReport {
     pub findings: Vec<Finding>,
     /// Whether the static-analyzer pass ran.
     pub analyzed: bool,
-    /// Files the analyzer could not process (zig cc's `--analyze` frontend does
-    /// not inherit the cross-target sysroot include paths, so any TU pulling in
-    /// a system header fails to resolve it). This is a tooling limitation, not a
-    /// code defect, so it is counted separately and never gates the build.
+    /// Analyzer skipped file count (missing cross-target includes under --analyze).
     pub analyze_unavailable: usize,
 }
 
@@ -88,19 +71,19 @@ fn resolve(root: &Path, p: &str) -> PathBuf {
     }
 }
 
-/// A process-unique, monotonically increasing nonce used to bust `zig cc`'s
-/// compile cache so diagnostics are emitted on every run (see module docs).
+/// Unique -DMM_LINT_NONCE to bust zig cc cache.
 fn next_nonce() -> u64 {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let base = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0);
-    base ^ (COUNTER.fetch_add(1, Ordering::Relaxed).wrapping_mul(0x9E3779B97F4A7C15))
+    base ^ (COUNTER
+        .fetch_add(1, Ordering::Relaxed)
+        .wrapping_mul(0x9E3779B97F4A7C15))
 }
 
-/// Run the linter. `analyze_override` forces the analyzer pass on/off regardless
-/// of the spec; `group_filter` limits to one group by name.
+/// Run lint; optional analyzer + group filter.
 pub fn run(
     root: &Path,
     spec: &LintSpec,
@@ -112,8 +95,7 @@ pub fn run(
     let analyze = analyze_override.unwrap_or(spec.analyze);
 
     let out_dir = root.join("build").join("lint");
-    std::fs::create_dir_all(&out_dir)
-        .with_context(|| format!("create {}", out_dir.display()))?;
+    std::fs::create_dir_all(&out_dir).with_context(|| format!("create {}", out_dir.display()))?;
 
     let mut report = LintReport {
         scanned: 0,
@@ -142,18 +124,15 @@ pub fn run(
         for src in &kept {
             report.scanned += 1;
             compile_pass(&zig, root, group, spec, &out_dir, src, &mut report.findings)?;
-            if analyze
-                && !analyze_pass(&zig, root, group, &out_dir, src, &mut report.findings)?
-            {
+            if analyze && !analyze_pass(&zig, root, group, &out_dir, src, &mut report.findings)? {
                 report.analyze_unavailable += 1;
             }
         }
     }
 
-    // The analyzer walks into `#include`d headers, so a vendored/third-party
-    // header (e.g. stb_truetype.h) can surface findings even though its source
-    // TU was excluded. Drop any finding located in an excluded file so the gate
-    // only ever fails on our own code.
+    // The analyzer walks into `#include`d headers, so a vendored/third-party header (e.g.
+    // stb_truetype.h) can surface findings even though its source TU was excluded. Drop any finding
+    // located in an excluded file so the gate only ever fails on our own code.
     report.findings.retain(|f| {
         let s = f.file.to_string_lossy();
         !spec.exclude.iter().any(|ex| s.contains(ex.as_str()))
@@ -204,13 +183,7 @@ fn compile_pass(
     Ok(())
 }
 
-/// A clang static-analyzer pass (`--analyze`). Finds path-sensitive bugs the
-/// warning set cannot (null derefs, uninitialised reads, leaks).
-///
-/// Returns `true` if the translation unit was analyzed, `false` if zig cc's
-/// analyzer frontend could not resolve the TU's system headers (reported as a
-/// bare `FileNotFound` at 1:1). Such tooling failures are *not* pushed as
-/// findings — they would be false positives that wrongly fail the gate.
+/// A clang static-analyzer pass (`--analyze`).
 fn analyze_pass(
     zig: &Path,
     root: &Path,
@@ -250,13 +223,12 @@ fn analyze_pass(
         .with_context(|| format!("spawn zig cc --analyze for {}", src.display()))?;
     let stderr = String::from_utf8_lossy(&o.stderr);
 
-    // zig cc's `--analyze` driver cannot fully set up a cross-target analysis:
-    // it parses and analyzes the primary TU (emitting genuine path-sensitive
-    // findings) but then bails on the first unresolved system header with a bare
-    // `FileNotFound` at 1:1 (or `fatal error: '...' file not found`). We keep the
-    // genuine findings it produced and swallow only the tooling error; a TU that
-    // raised one is reported as "partially analyzed" (returns false) so the
-    // summary can be honest about coverage, but it never gates the build.
+    // zig cc's `--analyze` driver cannot fully set up a cross-target analysis: it parses and
+    // analyzes the primary TU (emitting genuine path-sensitive findings) but then bails on the
+    // first unresolved system header with a bare `FileNotFound` at 1:1 (or `fatal error: '...' file
+    // not found`). We keep the genuine findings it produced and swallow only the tooling error; a
+    // TU that raised one is reported as "partially analyzed" (returns false) so the summary shows
+    // reduced coverage; it never gates the build.
     let fully_analyzed = !(stderr.contains("FileNotFound")
         || stderr.contains("file not found")
         || stderr.contains("fatal error:"));
@@ -265,9 +237,7 @@ fn analyze_pass(
     Ok(fully_analyzed)
 }
 
-/// Pull `path:line:col: warning|error: message [-Wflag]` lines out of compiler
-/// stderr. Ignores notes, the "N warnings generated." tallies, and any line
-/// originating in system/vendor headers the analyzer may walk into.
+/// Pull `path:line:col: warning|error: message [-Wflag]` lines out of compiler stderr.
 fn parse_diagnostics(group: &str, stderr: &str, out: &mut Vec<Finding>) {
     for line in stderr.lines() {
         let (kind, idx) = if let Some(i) = line.find(": warning:") {
@@ -277,8 +247,8 @@ fn parse_diagnostics(group: &str, stderr: &str, out: &mut Vec<Finding>) {
         } else {
             continue;
         };
-        // Drop zig's cross-target analyzer bailout pseudo-error (see
-        // analyze_pass): it is a tooling failure at 1:1, not a code defect.
+        // Drop zig's cross-target analyzer bailout pseudo-error (see analyze_pass): it is a tooling
+        // failure at 1:1, not a code defect.
         if line[idx + 2..].trim() == "error: FileNotFound" {
             continue;
         }
@@ -289,8 +259,8 @@ fn parse_diagnostics(group: &str, stderr: &str, out: &mut Vec<Finding>) {
         let lineno = it.next().and_then(|s| s.trim().parse::<u32>().ok());
         let path = it.next();
         let (Some(col), Some(lineno), Some(path)) = (col, lineno, path) else {
-            // Not a file:line:col location (e.g. a bare "error:"); keep it anyway
-            // with zeroed location so nothing is silently dropped.
+            // Not a file:line:col location (e.g. a bare "error:"); keep it anyway with zeroed
+            // location so nothing is silently dropped.
             let rest = line[idx + 2..].trim();
             out.push(Finding {
                 group: group.to_string(),
@@ -325,8 +295,7 @@ fn parse_diagnostics(group: &str, stderr: &str, out: &mut Vec<Finding>) {
     }
 }
 
-/// Fail the command if the tree is not clean. Returns an error carrying the
-/// headline count (the caller has already printed the detail).
+/// Fail if lint findings remain.
 pub fn gate(report: &LintReport) -> Result<()> {
     if report.is_clean() {
         Ok(())

@@ -16,13 +16,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-//! Minimal POSIX ustar writer for Odin AP packages.
-//!
-//! Odin accepts a plain `.tar` of the `*.img.lz4` members (it only verifies an
-//! appended MD5 when the file is named `*.tar.md5`). We emit ustar headers with
-//! empty uname/gname and mode 0644 — the same shape the reference
-//! `tar -H ustar` produced — so the result flashes identically but is built with
-//! no external `tar`.
+//! Minimal POSIX ustar writer for Odin AP tars.
 
 use std::fs::File;
 use std::io::{BufReader, Read, Write};
@@ -90,7 +84,7 @@ impl<W: Write> TarBuilder<W> {
         put_octal(&mut h, 116, 8, 0); // gid
         put_octal_size(&mut h, 124, 12, size); // size
         put_octal_size(&mut h, 136, 12, 0); // mtime (0 = reproducible)
-        // checksum field (148..156) left as spaces for the sum
+                                            // checksum field (148..156) left as spaces for the sum
         for b in &mut h[148..156] {
             *b = b' ';
         }

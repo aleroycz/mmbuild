@@ -16,9 +16,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-//! `build.prop` parsing. Device identity (model, device, SoC/platform) is read
-//! from the firmware itself — never hardcoded — and drives output naming and the
-//! SoC-based compatibility check.
+//! Read device model/SoC from firmware build.prop (not hardcoded).
 
 use std::collections::BTreeMap;
 
@@ -56,7 +54,11 @@ impl DeviceProps {
 
     /// Marketing/model code, e.g. "SM-A125F".
     pub fn model(&self) -> Option<&str> {
-        self.first(&["ro.product.system.model", "ro.product.model", "ro.product.vendor.model"])
+        self.first(&[
+            "ro.product.system.model",
+            "ro.product.model",
+            "ro.product.vendor.model",
+        ])
     }
     /// Device codename, e.g. "a12".
     pub fn device(&self) -> Option<&str> {
@@ -67,7 +69,7 @@ impl DeviceProps {
             "ro.build.product",
         ])
     }
-    /// SoC / board platform, e.g. "mt6765" — the key for SoC-based compat.
+    /// SoC / board platform, e.g. "mt6765" - the key for SoC-based compat.
     pub fn platform(&self) -> Option<&str> {
         self.first(&["ro.board.platform", "ro.hardware", "ro.chipname"])
     }
@@ -76,14 +78,24 @@ impl DeviceProps {
     pub fn output_stem(&self) -> String {
         let raw = self.model().or_else(|| self.device()).unwrap_or("device");
         raw.chars()
-            .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
             .collect()
     }
 }
 
 /// Read and parse build.prop from an opened system ext4 (tries common paths).
 pub fn read_from_ext4(fs: &mut Ext4) -> Result<DeviceProps> {
-    for path in ["/system/build.prop", "/build.prop", "/system/system/build.prop"] {
+    for path in [
+        "/system/build.prop",
+        "/build.prop",
+        "/system/system/build.prop",
+    ] {
         if let Ok(data) = fs.read_file(path) {
             return Ok(DeviceProps::parse(&String::from_utf8_lossy(&data)));
         }

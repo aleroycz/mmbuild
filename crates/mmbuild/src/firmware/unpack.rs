@@ -16,10 +16,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-//! Turn an acquired firmware artifact into a raw `super` image, recursively
-//! descending through the Samsung packaging: `.zip` → `AP_*.tar(.md5)` →
-//! `super.img.lz4` → sparse `super.img` → raw. Each layer is detected by magic,
-//! so a local file at any level (even a bare raw super) is handled.
+//! Recursively unpack firmware layers to raw super (zip/tar/lz4/sparse).
 
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -55,7 +52,9 @@ fn detect(path: &Path) -> Result<Kind> {
     }
     // ustar magic at offset 257.
     let mut ustar = [0u8; 5];
-    if f.seek(SeekFrom::Start(257)).is_ok() && f.read_exact(&mut ustar).is_ok() && &ustar == b"ustar"
+    if f.seek(SeekFrom::Start(257)).is_ok()
+        && f.read_exact(&mut ustar).is_ok()
+        && &ustar == b"ustar"
     {
         return Ok(Kind::Tar);
     }
@@ -76,8 +75,7 @@ fn is_super_member(name: &str) -> bool {
 }
 fn is_nested_archive(name: &str) -> bool {
     let b = name.to_ascii_lowercase();
-    (b.starts_with("ap_") || b.contains("/ap_"))
-        && (b.ends_with(".tar.md5") || b.ends_with(".tar"))
+    (b.starts_with("ap_") || b.contains("/ap_")) && (b.ends_with(".tar.md5") || b.ends_with(".tar"))
         || b.ends_with(".zip")
 }
 
@@ -142,7 +140,7 @@ fn extract_from_tar(input: &Path, workdir: &Path, log: &Logger) -> Result<PathBu
             }
         }
         // advance: header + data padded to 512
-        pos = data_off + ((size + 511) / 512) * 512;
+        pos = data_off + size.div_ceil(512) * 512;
     }
 
     if let Some((name, off, size)) = super_member {
@@ -151,7 +149,10 @@ fn extract_from_tar(input: &Path, workdir: &Path, log: &Logger) -> Result<PathBu
         log.info(&format!("extracted {name} from tar"));
         return to_raw_super(&out, workdir, log);
     }
-    bail!("no super.img(.lz4) or nested AP archive found in {}", input.display());
+    bail!(
+        "no super.img(.lz4) or nested AP archive found in {}",
+        input.display()
+    );
 }
 
 fn extract_from_zip(input: &Path, workdir: &Path, log: &Logger) -> Result<PathBuf> {

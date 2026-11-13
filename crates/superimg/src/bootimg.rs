@@ -8,18 +8,16 @@
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 
-//! Android boot image (`ANDROID!`) parse + rebuild, header versions 0–2 — the
-//! format used by boot.img and recovery.img on this device (recovery is v2).
-//!
-//! Layout: a page-aligned header followed by page-aligned kernel, ramdisk,
-//! second, recovery_dtbo (v1+) and dtb (v2+) sections. We parse the stock
-//! recovery image, swap its ramdisk for ours, and rebuild — recomputing the
-//! section sizes and the SHA-1 image id the same way mkbootimg does. Any AVB
-//! footer is dropped (verification is disabled via a patched vbmeta).
+//! ANDROID! boot/recovery image parse and rebuild (header v0-2).
 
 use anyhow::{bail, Result};
 
 const MAGIC: &[u8; 8] = b"ANDROID!";
+/// MagiskBoot `SEANDROID_MAGIC` - Samsung bootloader looks for this after payload.
+const SEANDROID_MAGIC: &[u8] = b"SEANDROIDENFORCE";
+/// MagiskBoot `SIGNER_VER02_MAGIC` / `SIGNER_VER02_SZ`.
+const SIGNER_VER02_MAGIC: &[u8] = b"SignerVer02";
+const SIGNER_VER02_SZ: usize = 512;
 
 #[derive(Debug, Clone)]
 pub struct BootImage {
@@ -41,6 +39,11 @@ pub struct BootImage {
     pub second: Vec<u8>,
     pub recovery_dtbo: Vec<u8>,
     pub dtb: Vec<u8>,
+    /// MagiskBoot proprietary tail: `SEANDROIDENFORCE` (+ optional 512-byte
+    /// `SignerVer02` blob copied from stock). Required for Samsung boot on
+    /// A125F even when vbmeta verification is disabled - Magisk always
+    /// re-appends this on repack; zero-padding alone is not enough.
+    pub samsung_tail: Vec<u8>,
 }
 
 fn rd_u32(b: &[u8], o: usize) -> u32 {
@@ -48,7 +51,14 @@ fn rd_u32(b: &[u8], o: usize) -> u32 {
 }
 fn rd_u64(b: &[u8], o: usize) -> u64 {
     u64::from_le_bytes([
-        b[o], b[o + 1], b[o + 2], b[o + 3], b[o + 4], b[o + 5], b[o + 6], b[o + 7],
+        b[o],
+        b[o + 1],
+        b[o + 2],
+        b[o + 3],
+        b[o + 4],
+        b[o + 5],
+        b[o + 6],
+        b[o + 7],
     ])
 }
 fn cstr(b: &[u8]) -> String {
@@ -59,7 +69,13 @@ fn npages(size: u32, page: u32) -> u64 {
     if page == 0 {
         return 0;
     }
-    ((size as u64) + (page as u64) - 1) / (page as u64)
+    (size as u64).div_ceil(page as u64)
+}
+fn npages_usize(size: usize, page: usize) -> usize {
+    if page == 0 {
+        return 0;
+    }
+    size.div_ceil(page)
 }
 
 impl BootImage {
@@ -93,7 +109,7 @@ impl BootImage {
         // Section offsets, each page-aligned, header occupies page 0..n.
         let p = page_size as u64;
         let mut off = npages(1, page_size) * p; // 1 page for header region
-        // (header region is exactly 1 page since header_size <= page_size)
+                                                // (header region is exactly 1 page since header_size <= page_size)
         off = p.max(off);
         let kernel = slice(buf, off, kernel_size)?;
         off += npages(kernel_size, page_size) * p;
@@ -109,10 +125,15 @@ impl BootImage {
             Vec::new()
         };
         let dtb = if dtb_size > 0 {
-            slice(buf, off, dtb_size)?
+            let d = slice(buf, off, dtb_size)?;
+            off += npages(dtb_size, page_size) * p;
+            d
         } else {
             Vec::new()
         };
+
+        // MagiskBoot: capture SEANDROIDENFORCE (+ SignerVer02) after AOSP payload.
+        let samsung_tail = extract_samsung_tail(buf, off as usize);
 
         Ok(BootImage {
             header_version,
@@ -133,13 +154,33 @@ impl BootImage {
             second,
             recovery_dtbo,
             dtb,
+            samsung_tail,
         })
     }
 
-    /// Rebuild the image bytes with the current sections. Section sizes and the
-    /// SHA-1 image id are recomputed; no AVB footer is appended.
+    /// Rebuild boot image; recompute sizes, dtbo offset, and SHA-1 id.
+    ///
+    /// If `pad_to` is `Some(n)` and the image is shorter than `n`, zero-pad to
+    /// `n` (Samsung AP images are partition-sized, typically 32 MiB, with an
+    /// AVB footer in the trailing padding - we drop the stock footer and rely
+    /// on a patched vbmeta with verification disabled).
     pub fn build(&self) -> Vec<u8> {
+        self.build_padded(None)
+    }
+
+    pub fn build_padded(&self, pad_to: Option<usize>) -> Vec<u8> {
         let page = self.page_size as usize;
+        /* Layout offsets (header occupies page 0). */
+        let mut off = page;
+        off += npages_usize(self.kernel.len(), page) * page;
+        off += npages_usize(self.ramdisk.len(), page) * page;
+        off += npages_usize(self.second.len(), page) * page;
+        let dtbo_offset = if self.header_version >= 1 && !self.recovery_dtbo.is_empty() {
+            off as u64
+        } else {
+            0
+        };
+
         let mut hdr = vec![0u8; page];
         hdr[0..8].copy_from_slice(MAGIC);
         wr_u32(&mut hdr, 8, self.kernel.len() as u32);
@@ -158,7 +199,7 @@ impl BootImage {
         put_str(&mut hdr, 608, &self.extra_cmdline, 1024);
         if self.header_version >= 1 {
             wr_u32(&mut hdr, 1632, self.recovery_dtbo.len() as u32);
-            wr_u64(&mut hdr, 1636, self.recovery_dtbo_offset);
+            wr_u64(&mut hdr, 1636, dtbo_offset);
             let hsz = if self.header_version >= 2 { 1660 } else { 1648 };
             wr_u32(&mut hdr, 1644, hsz);
         }
@@ -180,6 +221,15 @@ impl BootImage {
         }
         if self.header_version >= 2 && !self.dtb.is_empty() {
             push_padded(&mut out, &self.dtb, page);
+        }
+        // MagiskBoot proprietary Samsung tail (immediately after page-aligned payload).
+        if !self.samsung_tail.is_empty() {
+            out.extend_from_slice(&self.samsung_tail);
+        }
+        if let Some(n) = pad_to {
+            if out.len() < n {
+                out.resize(n, 0);
+            }
         }
         out
     }
@@ -203,11 +253,38 @@ impl BootImage {
     }
 }
 
+/// MagiskBoot repack: `SEANDROIDENFORCE` + optional 512-byte `SignerVer02` blob.
+fn extract_samsung_tail(buf: &[u8], payload_end: usize) -> Vec<u8> {
+    if payload_end + SEANDROID_MAGIC.len() > buf.len() {
+        return Vec::new();
+    }
+    if &buf[payload_end..payload_end + SEANDROID_MAGIC.len()] != SEANDROID_MAGIC {
+        // Some images have a small gap; search forward a page.
+        let search_to = (payload_end + 4096).min(buf.len());
+        if let Some(rel) = buf[payload_end..search_to]
+            .windows(SEANDROID_MAGIC.len())
+            .position(|w| w == SEANDROID_MAGIC)
+        {
+            return extract_samsung_tail(buf, payload_end + rel);
+        }
+        return Vec::new();
+    }
+    let mut tail = SEANDROID_MAGIC.to_vec();
+    let sig_off = payload_end + SEANDROID_MAGIC.len();
+    if sig_off + SIGNER_VER02_SZ <= buf.len() && buf[sig_off..].starts_with(SIGNER_VER02_MAGIC) {
+        tail.extend_from_slice(&buf[sig_off..sig_off + SIGNER_VER02_SZ]);
+    }
+    tail
+}
+
 fn slice(buf: &[u8], off: u64, size: u32) -> Result<Vec<u8>> {
     let off = off as usize;
     let end = off + size as usize;
     if end > buf.len() {
-        bail!("boot image section [{off}..{end}] runs past end ({})", buf.len());
+        bail!(
+            "boot image section [{off}..{end}] runs past end ({})",
+            buf.len()
+        );
     }
     Ok(buf[off..end].to_vec())
 }
@@ -230,15 +307,13 @@ fn push_padded(out: &mut Vec<u8>, data: &[u8], page: usize) {
     }
 }
 
-/// Extract the raw recovery image from an AP tar / lz4 / raw, returning its
-/// bytes. (Helper kept here so callers don't re-implement member hunting.)
+/// Extract raw boot/recovery image from AP tar/lz4.
 pub fn is_boot_magic(buf: &[u8]) -> bool {
     buf.len() >= 8 && &buf[0..8] == MAGIC
 }
 
 // --------------------------- minimal SHA-1 -------------------------------
-// Public-domain-style SHA-1 (RFC 3174) used only for the boot image id. We
-// deliberately avoid pulling in a crypto crate for a non-security hash.
+// Minimal RFC 3174 SHA-1 for boot image id only (not a security hash).
 
 struct Sha1 {
     h: [u32; 5],
@@ -344,23 +419,14 @@ mod tests {
     fn sha1_known_vectors() {
         let mut s = Sha1::new();
         s.update(b"abc");
-        assert_eq!(
-            hex(&s.finish()),
-            "a9993e364706816aba3e25717850c26c9cd0d89d"
-        );
+        assert_eq!(hex(&s.finish()), "a9993e364706816aba3e25717850c26c9cd0d89d");
         let mut s = Sha1::new();
         s.update(b"");
-        assert_eq!(
-            hex(&s.finish()),
-            "da39a3ee5e6b4b0d3255bfef95601890afd80709"
-        );
+        assert_eq!(hex(&s.finish()), "da39a3ee5e6b4b0d3255bfef95601890afd80709");
         // Multi-block (>64 bytes) to exercise buffering.
         let mut s = Sha1::new();
         s.update(&[b'a'; 1000]);
-        assert_eq!(
-            hex(&s.finish()),
-            "291e9a6c66994949b57ba5e650361e98fc36b1ba"
-        );
+        assert_eq!(hex(&s.finish()), "291e9a6c66994949b57ba5e650361e98fc36b1ba");
     }
 
     fn hex(b: &[u8]) -> String {
@@ -387,6 +453,7 @@ mod tests {
             second: Vec::new(),
             recovery_dtbo: Vec::new(),
             dtb: vec![7, 7, 7],
+            samsung_tail: Vec::new(),
         }
     }
 
@@ -404,5 +471,45 @@ mod tests {
         assert_eq!(back.name, "TEST");
         // Rebuilding the parsed image is byte-identical (stable id).
         assert_eq!(back.build(), bytes);
+    }
+
+    #[test]
+    fn dtbo_offset_tracks_ramdisk_size() {
+        let mut img = mkimg();
+        img.header_version = 1;
+        img.recovery_dtbo = vec![3; 100];
+        img.recovery_dtbo_offset = 999999; // stale; build must recompute
+        let bytes = img.build();
+        let back = BootImage::parse(&bytes).unwrap();
+        let page = img.page_size as usize;
+        let expect = page
+            + npages_usize(img.kernel.len(), page) * page
+            + npages_usize(img.ramdisk.len(), page) * page
+            + npages_usize(img.second.len(), page) * page;
+        assert_eq!(back.recovery_dtbo_offset, expect as u64);
+        assert_eq!(back.recovery_dtbo, img.recovery_dtbo);
+    }
+
+    #[test]
+    fn pad_to_preserves_payload() {
+        let img = mkimg();
+        let raw = img.build();
+        let padded = img.build_padded(Some(raw.len() + 4096));
+        assert_eq!(padded.len(), raw.len() + 4096);
+        assert_eq!(&padded[..raw.len()], &raw[..]);
+    }
+
+    #[test]
+    fn samsung_tail_roundtrip() {
+        let mut img = mkimg();
+        let mut tail = b"SEANDROIDENFORCE".to_vec();
+        let mut sig = vec![0u8; SIGNER_VER02_SZ];
+        sig[..11].copy_from_slice(b"SignerVer02");
+        tail.extend_from_slice(&sig);
+        img.samsung_tail = tail.clone();
+        let bytes = img.build_padded(Some(64 * 1024));
+        let back = BootImage::parse(&bytes).unwrap();
+        assert_eq!(back.samsung_tail, tail);
+        assert!(bytes.windows(16).any(|w| w == b"SEANDROIDENFORCE"));
     }
 }

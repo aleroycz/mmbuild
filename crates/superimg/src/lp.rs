@@ -16,14 +16,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-//! Android dynamic-partitions (LP / liblp) metadata reader.
-//!
-//! A `super` image starts with:
-//!   `[4096 reserved][4096 primary geometry][4096 backup geometry][metadata…]`
-//! The metadata names each logical partition (`system`, `vendor`, `product`, …)
-//! and the physical extents backing it. We parse it to learn, **from the image
-//! itself**, where the `system` partition lives — its byte offset and size —
-//! instead of hardcoding them. See AOSP `fs_mgr/liblp/include/liblp/metadata_format.h`.
+//! liblp metadata reader: logical partition offsets inside super.
 
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
@@ -64,8 +57,8 @@ impl Partition {
     pub fn first_offset(&self) -> Option<u64> {
         self.extents.first().map(|e| e.target_data * SECTOR)
     }
-    /// True if the partition is a single contiguous LINEAR extent — the case we
-    /// can safely edit in place.
+    /// True if the partition is a single contiguous LINEAR extent - the case we can safely edit in
+    /// place.
     pub fn is_contiguous(&self) -> bool {
         self.extents.len() == 1 && self.extents[0].target_type == TARGET_TYPE_LINEAR
     }
@@ -88,15 +81,19 @@ impl Metadata {
     }
 }
 
-fn rd_u16(b: &[u8], o: usize) -> u16 {
-    u16::from_le_bytes([b[o], b[o + 1]])
-}
 fn rd_u32(b: &[u8], o: usize) -> u32 {
     u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]])
 }
 fn rd_u64(b: &[u8], o: usize) -> u64 {
     u64::from_le_bytes([
-        b[o], b[o + 1], b[o + 2], b[o + 3], b[o + 4], b[o + 5], b[o + 6], b[o + 7],
+        b[o],
+        b[o + 1],
+        b[o + 2],
+        b[o + 3],
+        b[o + 4],
+        b[o + 5],
+        b[o + 6],
+        b[o + 7],
     ])
 }
 
@@ -126,8 +123,8 @@ pub fn read_metadata(path: &Path) -> Result<Metadata> {
     }
     let header_size = rd_u32(&hdr, 8) as u64;
 
-    // Table descriptors begin at byte 80: partitions, extents, groups, devices.
-    // descriptor = { offset:u32, num_entries:u32, entry_size:u32 }
+    // Table descriptors begin at byte 80: partitions, extents, groups, devices. descriptor = {
+    // offset:u32, num_entries:u32, entry_size:u32 }
     let part_off = rd_u32(&hdr, 80) as u64;
     let part_num = rd_u32(&hdr, 84);
     let part_entry = rd_u32(&hdr, 88) as u64;

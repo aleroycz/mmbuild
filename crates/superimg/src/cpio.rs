@@ -8,13 +8,7 @@
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 
-//! The `newc` cpio format (ASCII, 070701) used by Linux initramfs / Android
-//! ramdisks. Minimal reader + writer: enough to take apart a stock recovery
-//! ramdisk and build our own with a replacement `/init`.
-//!
-//! Each entry is a 110-byte ASCII header of 8-hex fields, then the NUL-padded
-//! name, then the file data, each padded to a 4-byte boundary. The archive ends
-//! with a `TRAILER!!!` entry.
+//! newc (070701) cpio read/write for Android initramfs.
 
 use anyhow::{bail, Result};
 
@@ -31,6 +25,8 @@ pub const S_IFLNK: u32 = 0o120000;
 #[derive(Debug, Clone)]
 pub struct Entry {
     pub name: String,
+    /// Original newc inode (0 = assign on write). MagiskBoot keeps stock inos.
+    pub ino: u32,
     pub mode: u32,
     pub uid: u32,
     pub gid: u32,
@@ -62,7 +58,7 @@ impl Entry {
     pub fn dir(name: &str, perm: u32) -> Entry {
         Entry::new(name, S_IFDIR | (perm & 0o7777), Vec::new())
     }
-    /// A symlink `name` → `target`.
+    /// A symlink `name` -> `target`.
     pub fn symlink(name: &str, target: &str) -> Entry {
         Entry::new(name, S_IFLNK | 0o777, target.as_bytes().to_vec())
     }
@@ -70,6 +66,7 @@ impl Entry {
     fn new(name: &str, mode: u32, data: Vec<u8>) -> Entry {
         Entry {
             name: name.to_string(),
+            ino: 0,
             mode,
             uid: 0,
             gid: 0,
@@ -97,8 +94,8 @@ pub fn read(buf: &[u8]) -> Result<Vec<Entry>> {
             break;
         }
         if &buf[off..off + 6] != MAGIC {
-            // Some archives pad to a 512-byte boundary with zeros before the
-            // next concatenated section; skip run of zeros.
+            // Some archives pad to a 512-byte boundary with zeros before the next concatenated
+            // section; skip run of zeros.
             if buf[off] == 0 {
                 off += 1;
                 continue;
@@ -109,6 +106,7 @@ pub fn read(buf: &[u8]) -> Result<Vec<Entry>> {
             );
         }
         let f = |i: usize| hex8(&buf[off + 6 + i * 8..off + 6 + i * 8 + 8]);
+        let ino = f(0)?;
         let mode = f(1)?;
         let uid = f(2)?;
         let gid = f(3)?;
@@ -127,8 +125,8 @@ pub fn read(buf: &[u8]) -> Result<Vec<Entry>> {
             bail!("cpio name runs past end");
         }
         let raw_name = &buf[name_off..name_off + namesize];
-        let name = String::from_utf8_lossy(raw_name.strip_suffix(&[0]).unwrap_or(raw_name))
-            .to_string();
+        let name =
+            String::from_utf8_lossy(raw_name.strip_suffix(&[0]).unwrap_or(raw_name)).to_string();
         // Header + name padded to 4 bytes.
         let data_off = name_off + namesize + pad4(110 + namesize);
         if name == TRAILER {
@@ -142,6 +140,7 @@ pub fn read(buf: &[u8]) -> Result<Vec<Entry>> {
 
         entries.push(Entry {
             name,
+            ino,
             mode,
             uid,
             gid,
@@ -158,16 +157,32 @@ pub fn read(buf: &[u8]) -> Result<Vec<Entry>> {
 }
 
 /// Serialize entries into a newc cpio archive (TRAILER appended, padded to 512).
+/// Preserves stock inode numbers (MagiskBoot); assigns fresh inos to new entries.
 pub fn write(entries: &[Entry]) -> Vec<u8> {
+    let mut next_ino = entries
+        .iter()
+        .map(|e| e.ino)
+        .max()
+        .unwrap_or(0)
+        .saturating_add(1);
+    if next_ino == 0 {
+        next_ino = 1;
+    }
     let mut out = Vec::new();
-    let mut ino = 1u32;
     for e in entries {
+        let ino = if e.ino != 0 {
+            e.ino
+        } else {
+            let i = next_ino;
+            next_ino = next_ino.saturating_add(1);
+            i
+        };
         write_entry(&mut out, e, ino);
-        ino += 1;
     }
     // Trailer: an entry named "TRAILER!!!" with nlink=1 and all else zero.
     let trailer = Entry {
         name: TRAILER.to_string(),
+        ino: 0,
         mode: 0,
         uid: 0,
         gid: 0,

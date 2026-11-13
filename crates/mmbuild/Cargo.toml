@@ -23,10 +23,8 @@ walkdir.workspace = true
 num_cpus.workspace = true
 ureq.workspace = true
 aes.workspace = true
-cbc.workspace = true
 ecb.workspace = true
 md-5.workspace = true
 sha2.workspace = true
-base64.workspace = true
 flate2.workspace = true
 zip = { version = "2", default-features = false, features = ["deflate"] }

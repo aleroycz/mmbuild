@@ -16,15 +16,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-//! `superimg` — a self-contained toolkit for Android `super` / `system` images.
-//!
-//! Pure Rust, no loop-mount and no external `img2simg` / `lz4` / `tar`, so it
-//! runs the same on Linux and Windows. Pieces:
-//!   * [`sparse`]  — Android sparse ↔ raw (`img2simg` / `simg2img`)
-//!   * [`lz4frame`] — standard lz4 frame (de)compression for Samsung `.lz4`
-//!   * [`lp`]      — dynamic-partition (liblp) metadata reader
-//!   * [`ext4`]    — ext4 reader + in-place patcher
-//!   * [`tarball`] — Odin-compatible ustar writer
+//! Pure-Rust Android super/system toolkit: sparse, lz4, lp, ext4, tar, bootimg, cpio.
 
 pub mod bootimg;
 pub mod cpio;

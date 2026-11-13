@@ -32,8 +32,8 @@ pub struct DirEntry {
     pub file_type: u8,
 }
 
-/// One leaf extent: `len` logical blocks starting at logical block `logical`
-/// map to physical blocks starting at `phys`.
+/// One leaf extent: `len` logical blocks starting at logical block `logical` map to physical
+/// blocks.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Leaf {
     pub logical: u32,
@@ -46,8 +46,8 @@ pub(crate) struct GroupDesc {
     pub block_bitmap: u64,
     pub inode_bitmap: u64,
     pub inode_table: u64,
-    /// Absolute byte offset of this descriptor within the partition, so the
-    /// writer can rewrite free counts after allocating.
+    /// Absolute byte offset of this descriptor within the partition, so the writer can rewrite free
+    /// counts after allocating.
     pub self_offset: u64,
 }
 
@@ -56,10 +56,12 @@ pub(crate) struct GroupDesc {
 pub(crate) struct Inode {
     pub ino: u32,
     pub raw: Vec<u8>,
+    #[allow(dead_code)]
     pub offset: u64, // absolute byte offset of the inode within the partition
     pub mode: u16,
     pub size: u64,
     pub flags: u32,
+    #[allow(dead_code)]
     pub blocks_lo: u32,
 }
 
@@ -85,8 +87,7 @@ pub struct Ext4 {
 }
 
 impl Ext4 {
-    /// Open the ext4 at `[base .. base+size)` of `path`. `writable` controls
-    /// whether the underlying file is opened read-write.
+    /// Open the ext4 at `[base ..
     pub fn open(path: &Path, base: u64, size: u64, writable: bool) -> Result<Ext4> {
         let file = OpenOptions::new()
             .read(true)
@@ -154,7 +155,8 @@ impl Ext4 {
 
     fn parse_superblock(&mut self) -> Result<()> {
         let mut sb = [0u8; 1024];
-        self.file.seek(SeekFrom::Start(self.base + SUPERBLOCK_OFFSET))?;
+        self.file
+            .seek(SeekFrom::Start(self.base + SUPERBLOCK_OFFSET))?;
         self.file.read_exact(&mut sb)?;
         let magic = u16::from_le_bytes([sb[56], sb[57]]);
         if magic != EXT4_MAGIC {
@@ -340,7 +342,7 @@ impl Ext4 {
     }
 
     /// Read the full contents of a regular file inode.
-    pub fn read_file_inode(&mut self, inode: &Inode) -> Result<Vec<u8>> {
+    pub(crate) fn read_file_inode(&mut self, inode: &Inode) -> Result<Vec<u8>> {
         if !inode.is_reg() {
             bail!("inode {} is not a regular file", inode.ino);
         }
@@ -381,16 +383,15 @@ impl Ext4 {
                         block[pos + 2],
                         block[pos + 3],
                     ]);
-                    let rec_len =
-                        u16::from_le_bytes([block[pos + 4], block[pos + 5]]) as usize;
+                    let rec_len = u16::from_le_bytes([block[pos + 4], block[pos + 5]]) as usize;
                     let name_len = block[pos + 6] as usize;
                     let file_type = block[pos + 7];
                     if rec_len < 8 {
                         break;
                     }
                     if ino != 0 && name_len > 0 && pos + 8 + name_len <= bs {
-                        let name =
-                            String::from_utf8_lossy(&block[pos + 8..pos + 8 + name_len]).to_string();
+                        let name = String::from_utf8_lossy(&block[pos + 8..pos + 8 + name_len])
+                            .to_string();
                         if name != "." && name != ".." {
                             entries.push(DirEntry {
                                 name,
@@ -472,9 +473,12 @@ fn find_selinux_entry(entries: &[u8], container: &[u8], value_base: usize) -> Op
             break; // end marker
         }
         let value_offs = u16::from_le_bytes([entries[pos + 2], entries[pos + 3]]) as usize;
-        let value_size =
-            u32::from_le_bytes([entries[pos + 8], entries[pos + 9], entries[pos + 10], entries[pos + 11]])
-                as usize;
+        let value_size = u32::from_le_bytes([
+            entries[pos + 8],
+            entries[pos + 9],
+            entries[pos + 10],
+            entries[pos + 11],
+        ]) as usize;
         if pos + 16 + name_len > entries.len() {
             break;
         }

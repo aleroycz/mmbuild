@@ -16,9 +16,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-//! ADB USB bulk transport via nusb (no libusb). Interface class 0xff/0x42/0x01,
-//! one bulk IN + one bulk OUT; header and payload go as separate writes, reads
-//! reassemble across transfers.
+//! ADB USB bulk IN/OUT via nusb (class 0xff/0x42/0x01).
 
 use anyhow::{anyhow, bail, Context, Result};
 use futures_lite::future::block_on;
@@ -66,7 +64,7 @@ impl UsbTransport {
                     ep_out,
                 }),
                 Ok(None) => {}
-                Err(_) => {} // can't open (driver/permissions) — skip, not fatal
+                Err(_) => {} // can't open (driver/permissions) - skip, not fatal
             }
         }
         Ok(out)
@@ -98,8 +96,7 @@ impl UsbTransport {
             return Ok(());
         }
         let comp = block_on(self.interface.bulk_out(self.ep_out, data));
-        comp.status
-            .map_err(|e| anyhow!("bulk OUT failed: {e:?}"))?;
+        comp.status.map_err(|e| anyhow!("bulk OUT failed: {e:?}"))?;
         Ok(())
     }
 
@@ -108,8 +105,7 @@ impl UsbTransport {
         while self.buf.len() < n {
             let want = (n - self.buf.len()).max(self.read_chunk);
             let comp = block_on(self.interface.bulk_in(self.ep_in, RequestBuffer::new(want)));
-            comp.status
-                .map_err(|e| anyhow!("bulk IN failed: {e:?}"))?;
+            comp.status.map_err(|e| anyhow!("bulk IN failed: {e:?}"))?;
             if comp.data.is_empty() {
                 bail!("device closed the USB stream (zero-length read)");
             }

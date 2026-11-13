@@ -16,7 +16,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-//! ADB transport-layer message framing (the `amessage` struct + payload).
+//! ADB `amessage` header encode/decode.
 
 use anyhow::{bail, Result};
 
@@ -50,7 +50,12 @@ pub struct Message {
 
 impl Message {
     pub fn new(command: u32, arg0: u32, arg1: u32, payload: Vec<u8>) -> Message {
-        Message { command, arg0, arg1, payload }
+        Message {
+            command,
+            arg0,
+            arg1,
+            payload,
+        }
     }
 
     /// The 24-byte header for this message.
@@ -66,9 +71,7 @@ impl Message {
         h
     }
 
-    /// Header followed by payload (one contiguous buffer). The transport sends
-    /// header and payload as two writes, so this is used mainly by tests and as
-    /// a convenience for callers that want the whole frame.
+    /// Header followed by payload (one contiguous buffer).
     #[allow(dead_code)]
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(HEADER_LEN + self.payload.len());
@@ -89,7 +92,8 @@ impl Message {
 
 /// adbd's payload checksum: the sum of all payload bytes (mod 2^32).
 pub fn checksum(data: &[u8]) -> u32 {
-    data.iter().fold(0u32, |acc, &b| acc.wrapping_add(u32::from(b)))
+    data.iter()
+        .fold(0u32, |acc, &b| acc.wrapping_add(u32::from(b)))
 }
 
 /// Parsed header fields.

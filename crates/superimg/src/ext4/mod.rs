@@ -16,20 +16,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-//! A focused ext4 reader/writer for patching an Android `system` partition in
-//! place, operating on a byte region `[base .. base+size)` of a larger file
-//! (the raw `super` image) so nothing is extracted or loop-mounted.
-//!
-//! Scope is deliberate — enough to do the two jobs the builder needs:
-//!   * read: resolve a path, read a file, read its xattrs (SELinux context),
-//!     list a directory, enumerate used blocks/inodes;
-//!   * write: replace a file's contents in place (shrinking or growing via the
-//!     block bitmap), create a new file in a directory, and delete one.
-//!
-//! It targets the common Android layout: 4 KiB blocks, extent-mapped inodes
-//! (`EXT4_FEATURE_INCOMPAT_EXTENTS`), 256-byte inodes, optional 64-bit feature.
-//! Htree-indexed directories are read through their backward-compatible linear
-//! entries. Unsupported shapes return a clear error rather than corrupting data.
+//! ext4 read/write on a byte slice of super for in-place system patching.
 
 mod reader;
 mod writer;
@@ -78,8 +65,8 @@ pub struct Superblock {
 
 impl Superblock {
     pub(crate) fn group_count(&self) -> u32 {
-        ((self.blocks_count - self.first_data_block as u64 + self.blocks_per_group as u64 - 1)
-            / self.blocks_per_group as u64) as u32
+        (self.blocks_count - self.first_data_block as u64).div_ceil(self.blocks_per_group as u64)
+            as u32
     }
 
     pub(crate) fn validate(&self) -> Result<()> {

@@ -8,15 +8,7 @@
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 
-//! Sub-project builds.
-//!
-//! A sub-project is any directory under the root with its own `build.toml`
-//! carrying a `[subproject]` table (see [`crate::config`]). mmbuild discovers
-//! them, builds each in dependency order, and INSTALLS the outputs in place —
-//! it never packs a tar for a sub-project. This replaces the hand-run
-//! `build_device.ps1` / `build_recovery.ps1` + manual copy-to-rootfs workflow
-//! and automates `external/` dependency acquisition (download + verify +
-//! extract + optional build).
+//! Discover, build, and install sub-projects from nested `[subproject]` build.toml.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -30,15 +22,14 @@ use crate::config::{
 };
 use crate::toolchain::compile_c;
 
-/// Build every discovered sub-project (dependency order), optionally filtered to
-/// a single `name`. Returns the names built. `include_manual` forces
-/// `manual = true` sub-projects to run even in the default pipeline.
+/// Build every discovered sub-project (dependency order), optionally filtered to a single `name`.
 pub fn build_all(
     root: &Path,
     settings: &Settings,
     log: &Logger,
     only: Option<&str>,
     include_manual: bool,
+    model: &str,
 ) -> Result<Vec<String>> {
     let found = discover_subprojects(root)?;
     if found.is_empty() {
@@ -66,7 +57,7 @@ pub fn build_all(
                 format!(" — {}", cfg.subproject.description)
             }
         ));
-        build_one(root, dir, cfg, settings, log)
+        build_one(root, dir, cfg, settings, log, model)
             .with_context(|| format!("sub-project '{name}'"))?;
         built.push(name.to_string());
     }
@@ -101,14 +92,23 @@ fn build_one(
     cfg: &SubprojectConfig,
     settings: &Settings,
     log: &Logger,
+    model: &str,
 ) -> Result<()> {
     match cfg.subproject.kind {
         SubKind::Cbinary => {
-            let spec = cfg
+            let mut spec = cfg
                 .build
                 .as_ref()
-                .context("[subproject] kind=cbinary requires a [build] section")?;
-            compile_c(root, spec, settings, log)?;
+                .context("[subproject] kind=cbinary requires a [build] section")?
+                .clone();
+            // device_compat profile is authoritative for the compile target here too, so a
+            // sub-project can't drift from the main binary's arch/-mcpu
+            for note in
+                crate::compat::reconcile_target(root, model, &mut spec.target, &mut spec.mcpu)?
+            {
+                log.info(&format!("[{}] {}", cfg.subproject.name, note));
+            }
+            compile_c(root, &spec, settings, log)?; // stamp written; up-to-date skips zig
         }
         SubKind::External => {
             let ext = cfg
@@ -127,8 +127,7 @@ fn build_one(
     Ok(())
 }
 
-/// Copy each `[[install]]` `from` → `to` (relative to root), creating parent
-/// directories. This is how a sub-project "places files where they belong".
+/// Apply [[install]] from->to copies under root.
 fn run_installs(root: &Path, installs: &[InstallSpec], log: &Logger) -> Result<()> {
     for ins in installs {
         let from = root.join(&ins.from);
@@ -161,12 +160,11 @@ fn set_mode(path: &Path, mode: &str) {
 
 #[cfg(not(unix))]
 fn set_mode(_path: &Path, _mode: &str) {
-    // Windows has no POSIX mode bits; the mode is applied when the file lands in
-    // the ext4 image (the image writer sets 0755 on /system/bin binaries).
+    // Windows has no POSIX mode bits; the mode is applied when the file lands in the ext4 image
+    // (the image writer sets 0755 on /system/bin binaries).
 }
 
-/// Acquire and (optionally) build an external dependency. Idempotent: a present
-/// `dir` skips download+extract; present `artifacts` skip the build command.
+/// Fetch/build external dep; skip if dir/artifacts exist.
 fn prepare_external(root: &Path, ext: &ExternalSpec, log: &Logger) -> Result<()> {
     let dir = root.join(&ext.dir);
 
@@ -201,8 +199,8 @@ fn prepare_external(root: &Path, ext: &ExternalSpec, log: &Logger) -> Result<()>
     }
 
     // 2. Build the dep if it declares a command and its artifacts are missing.
-    let artifacts_present = !ext.artifacts.is_empty()
-        && ext.artifacts.iter().all(|a| dir.join(a).exists());
+    let artifacts_present =
+        !ext.artifacts.is_empty() && ext.artifacts.iter().all(|a| dir.join(a).exists());
     if ext.build_command.is_empty() {
         if !ext.artifacts.is_empty() && !artifacts_present {
             log.warn("external artifacts missing and no build_command set");
@@ -215,7 +213,10 @@ fn prepare_external(root: &Path, ext: &ExternalSpec, log: &Logger) -> Result<()>
     }
 
     let prog = &ext.build_command[0];
-    log.info(&format!("building external: {}", ext.build_command.join(" ")));
+    log.info(&format!(
+        "building external: {}",
+        ext.build_command.join(" ")
+    ));
     let mut cmd = Command::new(prog);
     cmd.args(&ext.build_command[1..]);
     cmd.current_dir(&dir);
@@ -262,7 +263,11 @@ fn download(url: &str, dest: &Path, log: &Logger) -> Result<()> {
     let mut buf = Vec::new();
     std::io::Read::read_to_end(&mut reader, &mut buf).context("read response body")?;
     std::fs::write(dest, &buf).with_context(|| format!("write {}", dest.display()))?;
-    log.detail(&format!("saved {} ({})", dest.display(), mmcore::human_bytes(buf.len() as u64)));
+    log.detail(&format!(
+        "saved {} ({})",
+        dest.display(),
+        mmcore::human_bytes(buf.len() as u64)
+    ));
     Ok(())
 }
 
@@ -291,9 +296,7 @@ fn hex_lower(bytes: &[u8]) -> String {
     s
 }
 
-/// Extract a gzip-compressed POSIX tar (ustar / GNU) into `dest_dir`. A minimal
-/// reader kept in-tree so we depend only on flate2 (already vendored via zip)
-/// and not a separate tar crate.
+/// Extract a gzip-compressed POSIX tar (ustar / GNU) into `dest_dir`.
 fn extract_tar_gz(archive: &Path, dest_dir: &Path, log: &Logger) -> Result<()> {
     use flate2::read::GzDecoder;
     use std::io::Read;
@@ -344,8 +347,7 @@ fn extract_tar_gz(archive: &Path, dest_dir: &Path, log: &Logger) -> Result<()> {
                 if let Some(parent) = path.parent() {
                     std::fs::create_dir_all(parent).ok();
                 }
-                std::fs::write(&path, data)
-                    .with_context(|| format!("write {}", path.display()))?;
+                std::fs::write(&path, data).with_context(|| format!("write {}", path.display()))?;
                 count += 1;
             }
             // Symlinks/hardlinks/char/block/fifo: skipped (not needed for our deps).
@@ -354,7 +356,10 @@ fn extract_tar_gz(archive: &Path, dest_dir: &Path, log: &Logger) -> Result<()> {
         // Advance past the data, padded to the next 512-byte boundary.
         off += (size + 511) & !511;
     }
-    log.detail(&format!("extracted {count} file(s) to {}", dest_dir.display()));
+    log.detail(&format!(
+        "extracted {count} file(s) to {}",
+        dest_dir.display()
+    ));
     Ok(())
 }
 
@@ -387,8 +392,8 @@ fn parse_octal(b: &[u8]) -> Option<u64> {
     }
 }
 
-/// Reject absolute paths and `..` traversal so a malicious archive cannot write
-/// outside the destination directory.
+/// Reject absolute paths and `..` traversal so a malicious archive cannot write outside the
+/// destination directory.
 fn sanitize(name: &str) -> PathBuf {
     let mut out = PathBuf::new();
     for comp in name.split(['/', '\\']) {

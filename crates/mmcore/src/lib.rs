@@ -16,19 +16,13 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-//! `mmcore` — shared primitives for the MicroMiner builder toolchain.
-//!
-//! The headline piece is [`log`], a Gradle-style console: lifecycle task lines
-//! above a live status bar that shows overall progress, the current phase and
-//! elapsed time. Everything else here is small glue (errors, byte formatting)
-//! shared by `superimg` and `mmbuild`.
+//! Shared helpers: anyhow re-export, human_bytes, human_duration.
 
 pub mod log;
 
 pub use anyhow::{anyhow, bail, Context, Error, Result};
 
-/// Human-readable byte size, e.g. `3.29 GiB`, matching the scale the Android
-/// image tools print so logs line up with what people expect from `ls -l`.
+/// Human byte size (e.g. 3.29 GiB).
 pub fn human_bytes(n: u64) -> String {
     const UNITS: [&str; 6] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
     if n < 1024 {
@@ -43,8 +37,7 @@ pub fn human_bytes(n: u64) -> String {
     format!("{v:.2} {}", UNITS[u])
 }
 
-/// Human-readable duration in the `1m 3s` / `12s` / `450ms` style Gradle uses
-/// for its `BUILD SUCCESSFUL in …` footer.
+/// Human-readable duration (`450ms`, `12s`, `1m 3s`, `2h 5m 0s`).
 pub fn human_duration(d: std::time::Duration) -> String {
     let ms = d.as_millis();
     if ms < 1000 {
